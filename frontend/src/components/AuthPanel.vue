@@ -7,9 +7,8 @@ defineProps<{
 
 <template>
   <main class="auth-shell">
-    <RouterLink class="brand auth-brand" to="/">
-      <span class="brand-mark">V</span>
-      <span>viacora</span>
+    <RouterLink class="brand auth-brand" to="/" aria-label="Viacora home">
+      <img class="brand-logo" :src="'/images/logo.png'" alt="Viacora" />
     </RouterLink>
     <section class="auth-panel">
       <h1>{{ title }}</h1>

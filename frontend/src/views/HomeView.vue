@@ -3,7 +3,6 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useQuery } from '@tanstack/vue-query'
 import {
-  BookOpen,
   Check,
   CircleHelp,
   Database,
@@ -66,8 +65,7 @@ const databaseHealth = useQuery({
   <main class="shell">
     <header class="topbar">
       <RouterLink class="brand" to="/" aria-label="Viacora home">
-        <span class="brand-mark"><BookOpen :size="18" :stroke-width="2.2" /></span>
-        <span>viacora</span>
+        <img class="brand-logo" :src="'/images/logo.png'" alt="Viacora" />
       </RouterLink>
       <span class="topbar-label">Your learning space</span>
       <button class="text-button" type="button" :disabled="loggingOut" @click="logout">
