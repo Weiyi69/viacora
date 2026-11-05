@@ -9,10 +9,22 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Local database files and dumps
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+*.dump
+*.backup
+*.sql.gz
+
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
+backend/.local-outbox/
 
 .idea/
 .vscode/*

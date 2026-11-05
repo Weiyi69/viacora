@@ -9,8 +9,10 @@ description = "FastAPI backend for Viacora"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.14",
+    "email-validator>=2.3.0",
     "fastapi>=0.115",
     "psycopg[binary]>=3.2",
+    "pwdlib[argon2]>=0.3.1",
     "pydantic-settings>=2.7",
     "python-dotenv>=1.0",
     "sqlalchemy>=2.0",

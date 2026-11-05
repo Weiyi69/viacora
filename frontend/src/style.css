@@ -286,6 +286,133 @@ a {
   color: var(--green);
 }
 
+.auth-shell {
+  width: min(460px, calc(100% - 36px));
+  margin: 0 auto;
+  padding: 48px 0;
+}
+
+.auth-brand {
+  margin: 0 0 28px;
+}
+
+.auth-panel {
+  padding: 34px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--paper);
+  box-shadow: 0 16px 48px rgb(39 71 53 / 6%);
+}
+
+.auth-panel h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: -0.05em;
+}
+
+.auth-description {
+  margin: 9px 0 24px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.auth-form {
+  display: grid;
+  gap: 16px;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.auth-form input {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid #dfe6df;
+  border-radius: 10px;
+  background: white;
+  color: var(--ink);
+  font: inherit;
+}
+
+.auth-form input:focus {
+  outline: 2px solid rgb(46 116 91 / 22%);
+  border-color: var(--green);
+}
+
+.auth-form small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.primary-button {
+  min-height: 45px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--green);
+  color: white;
+  font-weight: 600;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: var(--green-dark);
+}
+
+.primary-button:disabled,
+.text-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.text-button {
+  border: 0;
+  background: transparent;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.auth-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 20px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auth-links a,
+.form-success a {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.form-error,
+.form-success {
+  margin: 12px 0;
+  padding: 11px 13px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.form-error {
+  background: #fff0ed;
+  color: #a63e2d;
+}
+
+.form-success {
+  background: var(--green-pale);
+  color: var(--green-dark);
+}
+
 @media (max-width: 760px) {
   .shell {
     width: min(100% - 36px, 540px);
@@ -314,6 +441,14 @@ a {
     align-items: start;
     flex-direction: column;
     gap: 5px;
+  }
+
+  .auth-panel {
+    padding: 26px 21px;
+  }
+
+  .topbar-label {
+    display: none;
   }
 }
 

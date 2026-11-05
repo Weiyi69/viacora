@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useQuery } from '@tanstack/vue-query'
 import {
   BookOpen,
@@ -11,10 +13,16 @@ import {
   Server,
   Sparkles,
 } from '@lucide/vue'
+import { useAuthStore } from '../stores/auth'
 
 type HealthStatus = {
   status: 'ok'
 }
+
+const auth = useAuthStore()
+const router = useRouter()
+const logoutError = ref('')
+const loggingOut = ref(false)
 
 async function fetchHealth(path: string): Promise<HealthStatus> {
   const response = await fetch(path)
@@ -24,6 +32,19 @@ async function fetchHealth(path: string): Promise<HealthStatus> {
   }
 
   return response.json() as Promise<HealthStatus>
+}
+
+async function logout(): Promise<void> {
+  logoutError.value = ''
+  loggingOut.value = true
+  try {
+    await auth.logout()
+    await router.push('/login')
+  } catch {
+    logoutError.value = 'Unable to sign out right now. Please try again.'
+  } finally {
+    loggingOut.value = false
+  }
 }
 
 const apiHealth = useQuery({
@@ -49,8 +70,12 @@ const databaseHealth = useQuery({
         <span>viacora</span>
       </RouterLink>
       <span class="topbar-label">Your learning space</span>
+      <button class="text-button" type="button" :disabled="loggingOut" @click="logout">
+        {{ loggingOut ? 'Signing out…' : 'Sign out' }}
+      </button>
     </header>
 
+    <p v-if="logoutError" class="form-error" role="alert">{{ logoutError }}</p>
     <section class="hero" aria-labelledby="welcome-title">
       <div class="hero-copy">
         <div class="eyebrow"><Sparkles :size="14" /> A little more you, in every lesson</div>
