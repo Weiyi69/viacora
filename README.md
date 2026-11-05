@@ -17,6 +17,27 @@ password recovery, and a private local email outbox. User, session, token, and
 rate-limit tables are managed by Alembic; the application never creates its
 schema at startup.
 
+## Phase 3: Learning workspace
+
+The authenticated workspace lets each user manage subjects, study spaces, and
+ordered topics. Subjects are owned directly by the signed-in user; study spaces
+and topics are authorized through their parent resources. Duplicate names are
+allowed. Archiving is reversible and independent at each level, while a
+confirmed permanent delete removes nested resources and their related activity.
+
+The dashboard reports persisted subject and study-space counts and actual
+creation/access activity. Opening a subject or study space records an explicit
+access event with a five-minute per-resource deduplication window; read-only
+GET requests do not write activity. API and database health checks remain
+available in the authenticated **System status** page and at the existing
+health endpoints.
+
+Learning API routes are under `/api/v1`: `/dashboard`, `/subjects`,
+`/subjects/{subject_id}/study-spaces`, `/study-spaces/{study_space_id}`,
+`/study-spaces/{study_space_id}/topics`, `/topics/{topic_id}`, and `/activity`.
+Mutating endpoints require the existing authenticated session and CSRF/Origin
+protections. The frontend uses TanStack Vue Query for learning-resource data.
+
 ## Prerequisites
 
 - Node.js 24 and pnpm 10
@@ -56,8 +77,7 @@ Docker is not required.
 
 5. Open the Vite URL shown in the terminal. Registration sends verification
    messages to `backend\.local-outbox\`; that directory is private, ignored by
-   Git, and is not exposed by the API or frontend. The home dashboard continues
-   to report API and database health independently.
+   Git, and is not exposed by the API or frontend.
 
 ### Optional Gmail delivery for local development
 
@@ -130,3 +150,16 @@ then run:
 Set-Location backend
 uv run pytest -m integration
 ```
+
+The learning schema's PostgreSQL constraint and cascade integration test is
+also opt-in. Configure `LEARNING_TEST_DATABASE_URL` for a separate disposable
+PostgreSQL database ending in `_test`, distinct from `DATABASE_URL`, then run:
+
+```powershell
+Set-Location backend
+uv run pytest -m integration tests/test_learning_postgresql_integration.py
+```
+
+Do not point either integration-test URL at `viacora_dev` or a production
+database. The normal backend test suite applies migrations only to temporary
+SQLite databases.

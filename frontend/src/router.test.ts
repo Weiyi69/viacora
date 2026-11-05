@@ -43,4 +43,20 @@ describe('authenticated routes', () => {
 
     expect(router.currentRoute.value.name).toBe('verify-email')
   })
+
+  it('protects learning and system-status pages behind authentication', async () => {
+    setActivePinia(createPinia())
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValueOnce(sessionResponse(false)))
+
+    await router.push('/subjects')
+
+    expect(router.currentRoute.value.name).toBe('login')
+    expect(router.currentRoute.value.query.redirect).toBe('/subjects')
+    expect(
+      router.options.routes
+        .filter((route) => route.name !== 'login' && route.name !== 'register')
+        .filter((route) => ['home', 'subjects', 'subject-detail', 'study-space-detail', 'system-status'].includes(String(route.name)))
+        .every((route) => route.meta?.requiresAuth),
+    ).toBe(true)
+  })
 })

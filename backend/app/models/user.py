@@ -36,3 +36,9 @@ class User(Base):
     email_action_tokens: Mapped[list["EmailActionToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    subjects: Mapped[list["Subject"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
+    learning_activities: Mapped[list["LearningActivity"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )

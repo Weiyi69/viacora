@@ -46,4 +46,22 @@ describe('API client', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
     expect(fetchMock.mock.calls[0][1]?.credentials).toBe('include')
   })
+
+  it('bootstraps CSRF for DELETE and accepts an empty success response', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({ csrf_token: 'delete-csrf-token' }),
+    ).mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: async () => undefined,
+    } as Response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.delete('/subjects/subject-id')
+
+    const [, options] = fetchMock.mock.calls[1]
+    expect(options?.method).toBe('DELETE')
+    expect(options?.credentials).toBe('include')
+    expect(new Headers(options?.headers).get('X-CSRF-Token')).toBe('delete-csrf-token')
+  })
 })

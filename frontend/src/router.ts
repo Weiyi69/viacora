@@ -4,6 +4,10 @@ import HomeView from './views/HomeView.vue'
 import LoginView from './views/LoginView.vue'
 import RegisterView from './views/RegisterView.vue'
 import ResetPasswordView from './views/ResetPasswordView.vue'
+import StudySpaceDetailView from './views/StudySpaceDetailView.vue'
+import SubjectDetailView from './views/SubjectDetailView.vue'
+import SubjectsView from './views/SubjectsView.vue'
+import SystemStatusView from './views/SystemStatusView.vue'
 import VerifyEmailView from './views/VerifyEmailView.vue'
 import { useAuthStore } from './stores/auth'
 
@@ -18,6 +22,25 @@ export const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'home', component: HomeView, meta: { requiresAuth: true } },
+    { path: '/subjects', name: 'subjects', component: SubjectsView, meta: { requiresAuth: true } },
+    {
+      path: '/subjects/:subjectId',
+      name: 'subject-detail',
+      component: SubjectDetailView,
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/study-spaces/:studySpaceId',
+      name: 'study-space-detail',
+      component: StudySpaceDetailView,
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/system-status',
+      name: 'system-status',
+      component: SystemStatusView,
+      meta: { requiresAuth: true },
+    },
     { path: '/login', name: 'login', component: LoginView, meta: { guestOnly: true } },
     { path: '/register', name: 'register', component: RegisterView, meta: { guestOnly: true } },
     { path: '/forgot-password', name: 'forgot-password', component: ForgotPasswordView },

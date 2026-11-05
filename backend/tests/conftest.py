@@ -5,7 +5,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.v1.dependencies import database_session
@@ -41,6 +41,13 @@ def auth_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[Te
     command.upgrade(config, "head")
 
     engine = create_engine(database_url, connect_args={"check_same_thread": False})
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(connection, _record) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     factory = sessionmaker(bind=engine, expire_on_commit=False)
 
     def override_session() -> Generator[Session, None, None]:
