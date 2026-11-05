@@ -9,6 +9,7 @@ from starlette.responses import Response
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
+from app.security.request_limits import RequestBodyLimitMiddleware
 from app.security.csrf import validate_request_origin
 
 settings = get_settings()
@@ -39,6 +40,11 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
     expose_headers=["Retry-After"],
+)
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_bytes=settings.document_max_request_bytes,
+    allowed_origins=set(_frontend_origins()),
 )
 
 

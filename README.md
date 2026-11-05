@@ -38,6 +38,37 @@ Learning API routes are under `/api/v1`: `/dashboard`, `/subjects`,
 Mutating endpoints require the existing authenticated session and CSRF/Origin
 protections. The frontend uses TanStack Vue Query for learning-resource data.
 
+## Phase 4: Private PDF documents
+
+Authenticated users can upload PDFs to an active study space, optionally
+assign them to a topic, review extracted page text, retry eligible transient
+failures, and download their original PDF. Documents are private and scoped to
+the signed-in user and their subject/study-space hierarchy. The upload limit is
+25 MiB, the multipart request cap is 26 MiB, and processing is limited to 500
+pages and 10 MiB of extracted text. No OCR is performed. Storage is limited to
+500 MiB per user and 10 upload attempts per rolling hour by default; the
+backend `.env.example` lists the corresponding settings.
+
+Local file storage defaults to the ignored `backend\.local-storage` directory.
+Keep that path outside any public/static web root. The database stores metadata
+and extracted text, never the PDF bytes or a public storage URL. The background
+worker is a separate process and uses PostgreSQL for its durable queue and
+leases; it does not require Redis or Docker. Run it from a second terminal:
+
+```powershell
+Set-Location backend
+uv run python -m app.worker
+```
+
+In production, configure a private persistent storage location, enforce the
+26 MiB request cap at the reverse proxy as well as in the API, and run the
+worker with deployment-level CPU/memory limits and malware scanning. Inline
+preview is intentionally disabled in production; enabling it requires a
+single-use, owner-authorized bridge on a separately isolated preview origin.
+Attachments remain owner-authorized. The selected pure-Python `pypdf` parser
+uses a BSD-style license and publishes universal wheels supporting Python
+3.12+ including the project's Windows Python 3.14 environment.
+
 ## Prerequisites
 
 - Node.js 24 and pnpm 10

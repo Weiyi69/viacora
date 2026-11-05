@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     smtp_from_address: str | None = None
     smtp_starttls: bool = True
     email_outbox_path: Path = PROJECT_ROOT / "backend" / ".local-outbox"
+    document_storage_path: Path = PROJECT_ROOT / "backend" / ".local-storage"
+    document_max_upload_bytes: int = 25 * 1024 * 1024
+    document_max_request_bytes: int = 26 * 1024 * 1024
+    document_storage_quota_bytes: int = 500 * 1024 * 1024
+    document_uploads_per_hour: int = 10
+    document_max_pages: int = 500
+    document_max_extracted_text_bytes: int = 10 * 1024 * 1024
+    document_worker_lease_seconds: int = 300
+    document_retry_base_seconds: int = 60
+    document_retry_max_seconds: int = 3600
     verification_token_ttl_hours: int = 24
     password_reset_token_ttl_minutes: int = 60
     password_min_length: int = 12
@@ -97,6 +107,29 @@ class Settings(BaseSettings):
         )
         if any(limit < 1 for limit in rate_limits):
             raise ValueError("Authentication rate limits must be positive")
+        document_limits = (
+            self.document_max_upload_bytes,
+            self.document_max_request_bytes,
+            self.document_storage_quota_bytes,
+            self.document_uploads_per_hour,
+            self.document_max_pages,
+            self.document_max_extracted_text_bytes,
+            self.document_worker_lease_seconds,
+            self.document_retry_base_seconds,
+            self.document_retry_max_seconds,
+        )
+        if any(limit < 1 for limit in document_limits):
+            raise ValueError("Document processing limits must be positive")
+        if self.document_max_request_bytes <= self.document_max_upload_bytes:
+            raise ValueError("DOCUMENT_MAX_REQUEST_BYTES must exceed DOCUMENT_MAX_UPLOAD_BYTES")
+        if self.document_max_upload_bytes > 25 * 1024 * 1024:
+            raise ValueError("DOCUMENT_MAX_UPLOAD_BYTES cannot exceed 25 MiB")
+        if self.document_max_pages > 500:
+            raise ValueError("DOCUMENT_MAX_PAGES cannot exceed 500")
+        if self.document_max_extracted_text_bytes > 10 * 1024 * 1024:
+            raise ValueError("DOCUMENT_MAX_EXTRACTED_TEXT_BYTES cannot exceed 10 MiB")
+        if self.document_retry_max_seconds < self.document_retry_base_seconds:
+            raise ValueError("Document retry maximum must not be less than its base")
         return self
 
 

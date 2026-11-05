@@ -16,6 +16,7 @@ import {
 import { getSubject } from '../api/subjects'
 import AppShell from '../components/AppShell.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import DocumentList from '../components/DocumentList.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingSkeleton from '../components/LoadingSkeleton.vue'
 import ModalDialog from '../components/ModalDialog.vue'
@@ -259,6 +260,8 @@ function saveStudySpace(input: ResourceInput): void {
         Create a study space
       </button>
     </EmptyState>
+
+    <DocumentList v-if="subjectQuery.data.value" :subject-id="subjectId" />
 
     <ModalDialog
       v-if="showForm"

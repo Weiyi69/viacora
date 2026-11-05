@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, Text, Uuid, func, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -12,6 +23,7 @@ class Subject(Base):
     __table_args__ = (
         CheckConstraint("length(trim(name)) > 0", name="ck_subjects_name_nonblank"),
         Index("ix_subjects_user_archived_updated", "user_id", "archived_at", "updated_at"),
+        UniqueConstraint("user_id", "id", name="uq_subjects_user_id_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)

@@ -25,6 +25,10 @@ function apiUrl(path: string): string {
   return `${API_BASE_URL}/api/v1${path}`
 }
 
+export function apiFileUrl(path: string): string {
+  return apiUrl(path)
+}
+
 async function csrfToken(): Promise<string> {
   const response = await fetch(apiUrl('/auth/csrf'), { credentials: 'include' })
   if (!response.ok) {
@@ -32,6 +36,49 @@ async function csrfToken(): Promise<string> {
   }
   const payload = (await response.json()) as { csrf_token: string }
   return payload.csrf_token
+}
+
+export async function apiUpload<T>(
+  path: string,
+  body: FormData,
+  onProgress: (progress: number) => void,
+): Promise<T> {
+  const token = await csrfToken()
+  return new Promise<T>((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open('POST', apiUrl(path))
+    request.withCredentials = true
+    request.setRequestHeader('X-CSRF-Token', token)
+    request.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable) {
+        onProgress(Math.round((event.loaded / event.total) * 100))
+      }
+    })
+    request.addEventListener('load', () => {
+      let payload: unknown
+      try {
+        payload = JSON.parse(request.responseText)
+      } catch {
+        payload = undefined
+      }
+      if (request.status >= 200 && request.status < 300) {
+        resolve(payload as T)
+        return
+      }
+      const detail =
+        typeof payload === 'object' && payload !== null && 'detail' in payload
+          ? String(payload.detail)
+          : 'The upload could not be completed. Please try again.'
+      reject(new ApiError(request.status, detail))
+    })
+    request.addEventListener('error', () => {
+      reject(new ApiError(0, 'Unable to reach the server. Please try again.'))
+    })
+    request.addEventListener('abort', () => {
+      reject(new ApiError(0, 'The upload was cancelled.'))
+    })
+    request.send(body)
+  })
 }
 
 export async function apiRequest<T>(

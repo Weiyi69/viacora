@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.models import LearningActivity, Topic
+from app.repositories import documents as document_repository
 from app.repositories import topics as topic_repository
 from app.schemas.learning import TopicCreate, TopicUpdate
 from app.services.study_spaces import get_study_space
@@ -144,6 +145,7 @@ def update_topic(
 
 def delete_topic(session: Session, *, user_id: UUID, topic_id: UUID) -> None:
     topic = get_topic(session, user_id=user_id, topic_id=topic_id)
+    document_repository.detach_documents_from_topic(session, topic_id=topic_id)
     session.delete(topic)
     try:
         session.commit()

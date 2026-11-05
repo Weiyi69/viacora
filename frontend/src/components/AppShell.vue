@@ -31,6 +31,7 @@ async function signOut(): Promise<void> {
       <nav class="app-nav" aria-label="Main navigation">
         <RouterLink to="/" exact-active-class="active">Dashboard</RouterLink>
         <RouterLink to="/subjects" active-class="active">Subjects</RouterLink>
+        <RouterLink to="/documents" active-class="active">Documents</RouterLink>
         <RouterLink to="/system-status" active-class="active">System status</RouterLink>
       </nav>
       <button class="text-button" type="button" :disabled="signingOut" @click="signOut">

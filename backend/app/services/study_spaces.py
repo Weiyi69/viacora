@@ -6,8 +6,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.models import LearningActivity, StudySpace
+from app.repositories import documents as document_repository
 from app.repositories import study_spaces as study_space_repository
 from app.schemas.learning import StudySpaceCreate, StudySpaceUpdate
+from app.services.document_storage import remove_storage_files
 from app.services.subjects import get_subject
 
 
@@ -124,9 +126,13 @@ def archive_study_space(
         user_id=user_id,
         study_space_id=study_space_id,
         allow_archived=True,
+        lock=True,
     )
     if study_space.archived_at is None:
         study_space.archived_at = datetime.now(timezone.utc)
+        document_repository.revoke_processing_for_parent(
+            session, study_space_id=study_space_id
+        )
         try:
             session.commit()
             session.refresh(study_space)
@@ -165,9 +171,17 @@ def delete_study_space(
         study_space_id=study_space_id,
         allow_archived=True,
     )
+    storage_keys = document_repository.storage_keys_for_parent(
+        session, study_space_id=study_space_id
+    )
     session.delete(study_space)
     try:
         session.commit()
     except SQLAlchemyError:
         session.rollback()
         raise
+    if remove_storage_files(storage_keys):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Study space was deleted but some private document files could not be removed",
+        )

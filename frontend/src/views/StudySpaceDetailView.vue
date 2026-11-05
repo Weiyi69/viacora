@@ -10,6 +10,7 @@ import { getStudySpace } from '../api/studySpaces'
 import { createTopic, deleteTopic, getTopics, updateTopic } from '../api/topics'
 import AppShell from '../components/AppShell.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import DocumentList from '../components/DocumentList.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingSkeleton from '../components/LoadingSkeleton.vue'
 import ModalDialog from '../components/ModalDialog.vue'
@@ -253,6 +254,12 @@ function moveTopic(topic: Topic, offset: number): void {
         Create a topic
       </button>
     </EmptyState>
+
+    <DocumentList
+      v-if="studySpaceQuery.data.value"
+      :subject-id="subjectId"
+      :study-space-id="studySpaceId"
+    />
 
     <ModalDialog
       v-if="showForm"

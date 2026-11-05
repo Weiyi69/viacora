@@ -55,7 +55,17 @@ describe('authenticated routes', () => {
     expect(
       router.options.routes
         .filter((route) => route.name !== 'login' && route.name !== 'register')
-        .filter((route) => ['home', 'subjects', 'subject-detail', 'study-space-detail', 'system-status'].includes(String(route.name)))
+        .filter((route) =>
+          [
+            'home',
+            'subjects',
+            'subject-detail',
+            'study-space-detail',
+            'documents',
+            'document-detail',
+            'system-status',
+          ].includes(String(route.name)),
+        )
         .every((route) => route.meta?.requiresAuth),
     ).toBe(true)
   })

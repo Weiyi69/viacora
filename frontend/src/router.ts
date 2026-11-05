@@ -1,5 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import ForgotPasswordView from './views/ForgotPasswordView.vue'
+import DocumentDetailView from './views/DocumentDetailView.vue'
+import DocumentsView from './views/DocumentsView.vue'
 import HomeView from './views/HomeView.vue'
 import LoginView from './views/LoginView.vue'
 import RegisterView from './views/RegisterView.vue'
@@ -23,6 +25,13 @@ export const router = createRouter({
   routes: [
     { path: '/', name: 'home', component: HomeView, meta: { requiresAuth: true } },
     { path: '/subjects', name: 'subjects', component: SubjectsView, meta: { requiresAuth: true } },
+    { path: '/documents', name: 'documents', component: DocumentsView, meta: { requiresAuth: true } },
+    {
+      path: '/documents/:documentId',
+      name: 'document-detail',
+      component: DocumentDetailView,
+      meta: { requiresAuth: true },
+    },
     {
       path: '/subjects/:subjectId',
       name: 'subject-detail',

@@ -1,7 +1,19 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, Uuid, func, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -13,6 +25,7 @@ class Topic(Base):
         CheckConstraint("length(trim(name)) > 0", name="ck_topics_name_nonblank"),
         CheckConstraint("position >= 0", name="ck_topics_position_nonnegative"),
         Index("ix_topics_study_space_position", "study_space_id", "position"),
+        UniqueConstraint("id", "study_space_id", name="uq_topics_id_study_space_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)

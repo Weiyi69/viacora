@@ -25,6 +25,7 @@ frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
 backend/.local-outbox/
+backend/.local-storage/
 
 .idea/
 .vscode/*

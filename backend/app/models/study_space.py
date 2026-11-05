@@ -8,6 +8,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
     text,
@@ -27,6 +28,7 @@ class StudySpace(Base):
             "archived_at",
             "updated_at",
         ),
+        UniqueConstraint("subject_id", "id", name="uq_study_spaces_subject_id_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
