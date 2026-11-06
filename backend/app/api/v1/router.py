@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.api.v1.routes import (
     activity,
+    ai,
     auth,
     dashboard,
     documents,
@@ -19,6 +20,7 @@ api_router.include_router(subjects.router)
 api_router.include_router(study_spaces.router)
 api_router.include_router(topics.router)
 api_router.include_router(activity.router)
+api_router.include_router(ai.router)
 api_router.include_router(documents.router)
 api_router.include_router(auth.router)
 api_router.include_router(users.router)

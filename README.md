@@ -69,11 +69,45 @@ Attachments remain owner-authorized. The selected pure-Python `pypdf` parser
 uses a BSD-style license and publishes universal wheels supporting Python
 3.12+ including the project's Windows Python 3.14 environment.
 
+## Phase 5: AI indexing and retrieval
+
+The backend AI foundation uses a server-side OpenAI key and the existing
+PostgreSQL worker. `AI_ENABLED` defaults to `false`; enabling it requires a
+valid provider key, the seeded 1536-dimensional embedding profile, a pricing
+version, and positive configured USD rates. Never put the provider key in the
+frontend or logs.
+
+The index stores page-aware chunks and vectors in a versioned generation. A
+replacement generation is staged separately and becomes active only after all
+chunks and vectors validate. When AI is enabled, extraction completion and
+initial indexing-job creation share one database transaction.
+PostgreSQL/pgvector is required:
+install the pgvector server package for the same PostgreSQL installation,
+verify `vector` is available, then apply the Alembic migration during an
+approved deployment. The migration enables the extension only if it is
+available and never removes the shared extension on downgrade.
+
+Chunk limits use a deliberately conservative UTF-8 byte upper bound rather
+than claiming an exact tokenizer count: chunks are capped at 1,024 UTF-8 bytes
+and embedding batches at 16 chunks / 16,384 UTF-8 bytes. Usage quotas reserve
+that bound before each provider request and conservatively account for
+requests with unknown outcomes. Defaults are 100,000 daily input tokens and
+USD 0.50 per user. Query bodies are capped at 8 KiB, query text at 2,048
+characters, and retrieval returns at most 8 passages (default 5).
+
+`POST /api/v1/ai/retrieval` requires the existing authenticated session and
+CSRF protections. It returns matching passage excerpts and source document/page
+references only; it does not generate answers or add a frontend. SQL retrieval
+filters by owner and active parent resources. Retrieved text is untrusted data,
+not instructions or tool input. `GET /api/v1/ai/usage` reports only the current
+user's recorded usage.
+
 ## Prerequisites
 
 - Node.js 24 and pnpm 10
 - Python 3.12 or newer (tested with Python 3.14)
 - PostgreSQL 18 running locally
+- pgvector installed for the PostgreSQL 18 server (Phase 5)
 
 Docker is not required.
 
@@ -194,3 +228,10 @@ uv run pytest -m integration tests/test_learning_postgresql_integration.py
 Do not point either integration-test URL at `viacora_dev` or a production
 database. The normal backend test suite applies migrations only to temporary
 SQLite databases.
+
+The Phase 5 PostgreSQL/pgvector integration tests are opt-in. Set
+`AI_TEST_DATABASE_URL` to a separate disposable PostgreSQL database ending in
+`_test`, with pgvector available, and never use `viacora_dev` or a production
+database. The tests apply Alembic migrations to that dedicated test database
+and validate vector behavior; SQLite does not validate pgvector types,
+operators, or indexes.

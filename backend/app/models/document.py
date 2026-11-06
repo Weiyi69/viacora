@@ -108,6 +108,9 @@ class Document(Base):
         passive_deletes=True,
         order_by="DocumentPage.page_number",
     )
+    index_generations: Mapped[list["DocumentIndexGeneration"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class DocumentPage(Base):

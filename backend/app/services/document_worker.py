@@ -12,6 +12,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.models import Document, DocumentPage, DocumentUploadAttempt, StudySpace, Subject
 from app.services.document_storage import storage_path
+from app.services.document_indexing import (
+    ensure_index_generation,
+    process_next_index_job,
+    reconcile_missing_indexes,
+)
+from app.services.ai_usage_reservations import recover_expired_reservations
 from app.services.pdf_extraction import (
     PermanentPdfError,
     StaleDocumentLease,
@@ -23,6 +29,7 @@ logger = logging.getLogger(__name__)
 MAX_PROCESSING_ATTEMPTS = 3
 ORPHAN_GRACE_PERIOD = timedelta(hours=1)
 ORPHAN_CLEANUP_INTERVAL = timedelta(hours=1)
+AI_RECOVERY_INTERVAL = timedelta(minutes=1)
 _STORAGE_FILENAME = re.compile(r"[a-f0-9]{32}\.pdf\Z")
 
 
@@ -204,6 +211,9 @@ def _publish_result(
         document.lease_token = None
         document.lease_expires_at = None
         document.processed_at = now
+        settings = get_settings()
+        if has_text and settings.ai_enabled:
+            ensure_index_generation(session, document, settings=settings)
         session.commit()
 
 
@@ -282,7 +292,10 @@ def process_next_document(session_factory: sessionmaker[Session]) -> bool:
             retryable=True,
         )
     else:
-        _publish_result(session_factory, lease, pages, has_text)
+        try:
+            _publish_result(session_factory, lease, pages, has_text)
+        except Exception:
+            logger.exception("Could not atomically hand off extracted document for indexing")
     return True
 
 
@@ -329,9 +342,21 @@ def run_worker(
 ) -> None:
     reconcile_orphaned_files(session_factory)
     last_cleanup = time.monotonic()
+    last_ai_recovery = time.monotonic()
+    prefer_index = False
     while True:
         try:
-            processed = process_next_document(session_factory)
+            work = (
+                (process_next_index_job, process_next_document)
+                if prefer_index
+                else (process_next_document, process_next_index_job)
+            )
+            processed = False
+            for process in work:
+                if process(session_factory):
+                    processed = True
+                    break
+            prefer_index = not prefer_index
         except SQLAlchemyError:
             logger.exception("Document worker database operation failed")
             processed = False
@@ -343,5 +368,12 @@ def run_worker(
             except SQLAlchemyError:
                 logger.exception("Document storage reconciliation failed")
             last_cleanup = time.monotonic()
+        if time.monotonic() - last_ai_recovery >= AI_RECOVERY_INTERVAL.total_seconds():
+            try:
+                reconcile_missing_indexes(session_factory)
+                recover_expired_reservations(session_factory)
+            except SQLAlchemyError:
+                logger.exception("AI indexing or usage reconciliation failed")
+            last_ai_recovery = time.monotonic()
         if not processed:
             time.sleep(poll_interval_seconds)

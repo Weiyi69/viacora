@@ -14,7 +14,7 @@ def get_database_engine() -> Engine:
     if not database_url:
         raise RuntimeError("DATABASE_URL is not configured")
 
-    return create_engine(database_url, pool_pre_ping=True)
+    return create_engine(database_url, pool_pre_ping=True, hide_parameters=True)
 
 
 @lru_cache(maxsize=1)

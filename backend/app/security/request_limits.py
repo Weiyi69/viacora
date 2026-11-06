@@ -6,6 +6,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 _DOCUMENT_UPLOAD_PATH = re.compile(
     r"/api/v1/subjects/[^/]+/study-spaces/[^/]+/documents\Z"
 )
+_AI_RETRIEVAL_PATH = "/api/v1/ai/retrieval"
 
 
 class RequestBodyLimitMiddleware:
@@ -15,17 +16,29 @@ class RequestBodyLimitMiddleware:
         *,
         max_bytes: int,
         allowed_origins: set[str],
+        ai_max_bytes: int = 8192,
     ) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.ai_max_bytes = ai_max_bytes
         self.allowed_origins = allowed_origins
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
             scope["type"] != "http"
             or scope.get("method") != "POST"
-            or not _DOCUMENT_UPLOAD_PATH.fullmatch(scope.get("path", ""))
         ):
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if _DOCUMENT_UPLOAD_PATH.fullmatch(path):
+            max_bytes = self.max_bytes
+            message = b'{"detail":"Upload request exceeds the maximum size"}'
+        elif path == _AI_RETRIEVAL_PATH:
+            max_bytes = self.ai_max_bytes
+            message = b'{"detail":"Request body exceeds the maximum size"}'
+        else:
             await self.app(scope, receive, send)
             return
 
@@ -36,8 +49,8 @@ class RequestBodyLimitMiddleware:
                 declared_size = int(content_length)
             except ValueError:
                 declared_size = 0
-            if declared_size > self.max_bytes:
-                await self._reject(scope, send)
+            if declared_size > max_bytes:
+                await self._reject(scope, send, message)
                 return
 
         received_bytes = 0
@@ -47,17 +60,16 @@ class RequestBodyLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received_bytes += len(message.get("body", b""))
-                if received_bytes > self.max_bytes:
+                if received_bytes > max_bytes:
                     raise _RequestTooLarge
             return message
 
         try:
             await self.app(scope, limited_receive, send)
         except _RequestTooLarge:
-            await self._reject(scope, send)
+            await self._reject(scope, send, message)
 
-    async def _reject(self, scope: Scope, send: Send) -> None:
-        body = b'{"detail":"Upload request exceeds the maximum size"}'
+    async def _reject(self, scope: Scope, send: Send, body: bytes) -> None:
         headers = [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode("ascii")),

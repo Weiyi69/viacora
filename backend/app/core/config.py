@@ -1,7 +1,8 @@
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -34,6 +35,32 @@ class Settings(BaseSettings):
     document_worker_lease_seconds: int = 300
     document_retry_base_seconds: int = 60
     document_retry_max_seconds: int = 3600
+    ai_enabled: bool = False
+    openai_api_key: SecretStr | None = None
+    ai_embedding_model: str = "text-embedding-3-small"
+    ai_embedding_profile_id: str = "openai-text-embedding-3-small-1536-v1"
+    ai_embedding_dimensions: int = 1536
+    ai_structured_output_model: str = "gpt-4o-mini"
+    ai_provider_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    ai_provider_max_retries: int = Field(default=2, ge=0, le=5)
+    ai_provider_retry_base_seconds: float = Field(default=1.0, gt=0, le=30)
+    ai_provider_retry_max_seconds: float = Field(default=10.0, gt=0, le=120)
+    ai_max_request_bytes: int = Field(default=8192, gt=0, le=8192)
+    ai_query_max_chars: int = Field(default=2048, gt=0, le=2048)
+    ai_chunk_target_utf8_bytes: int = Field(default=800, gt=0, le=1024)
+    ai_chunk_max_utf8_bytes: int = Field(default=1024, gt=0, le=1024)
+    ai_chunk_overlap_utf8_bytes: int = Field(default=100, ge=0, le=1023)
+    ai_embedding_batch_max_chunks: int = Field(default=16, gt=0, le=16)
+    ai_embedding_batch_max_utf8_bytes: int = Field(default=16384, gt=0, le=16384)
+    ai_retrieval_default_top_k: int = Field(default=5, gt=0, le=8)
+    ai_retrieval_max_top_k: int = Field(default=8, gt=0, le=8)
+    ai_retrieval_min_similarity: float = Field(default=0.2, ge=0, le=1)
+    ai_daily_input_token_limit: int = Field(default=100_000, gt=0)
+    ai_daily_cost_limit_usd: Decimal = Field(default=Decimal("0.50"), gt=0)
+    ai_pricing_version: str | None = None
+    ai_embedding_input_usd_per_million: Decimal | None = Field(default=None, gt=0)
+    ai_structured_input_usd_per_million: Decimal | None = Field(default=None, gt=0)
+    ai_structured_output_usd_per_million: Decimal | None = Field(default=None, gt=0)
     verification_token_ttl_hours: int = 24
     password_reset_token_ttl_minutes: int = 60
     password_min_length: int = 12
@@ -130,6 +157,28 @@ class Settings(BaseSettings):
             raise ValueError("DOCUMENT_MAX_EXTRACTED_TEXT_BYTES cannot exceed 10 MiB")
         if self.document_retry_max_seconds < self.document_retry_base_seconds:
             raise ValueError("Document retry maximum must not be less than its base")
+        if self.ai_provider_retry_max_seconds < self.ai_provider_retry_base_seconds:
+            raise ValueError("AI retry maximum must not be less than its base")
+        if self.ai_chunk_overlap_utf8_bytes >= self.ai_chunk_max_utf8_bytes:
+            raise ValueError("AI chunk overlap must be smaller than the maximum byte size")
+        if self.ai_chunk_target_utf8_bytes > self.ai_chunk_max_utf8_bytes:
+            raise ValueError("AI chunk target must not exceed the maximum byte size")
+        if self.ai_retrieval_default_top_k > self.ai_retrieval_max_top_k:
+            raise ValueError("AI retrieval default top-k must not exceed its maximum")
+        if self.ai_embedding_dimensions != 1536:
+            raise ValueError("The initial AI embedding profile requires 1536 dimensions")
+        if self.ai_enabled:
+            if not self.openai_api_key or not self.openai_api_key.get_secret_value():
+                raise ValueError("OPENAI_API_KEY is required when AI_ENABLED is true")
+            if not self.ai_pricing_version:
+                raise ValueError("AI_PRICING_VERSION is required when AI_ENABLED is true")
+            required_rates = (
+                self.ai_embedding_input_usd_per_million,
+                self.ai_structured_input_usd_per_million,
+                self.ai_structured_output_usd_per_million,
+            )
+            if any(rate is None for rate in required_rates):
+                raise ValueError("AI pricing rates are required when AI_ENABLED is true")
         return self
 
 

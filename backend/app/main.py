@@ -44,6 +44,7 @@ app.add_middleware(
 app.add_middleware(
     RequestBodyLimitMiddleware,
     max_bytes=settings.document_max_request_bytes,
+    ai_max_bytes=settings.ai_max_request_bytes,
     allowed_origins=set(_frontend_origins()),
 )
 
