@@ -151,6 +151,18 @@ def reconcile_missing_indexes(
     enqueued = 0
     with session_factory() as session:
         _active_profile(session, settings)
+        current_ready_generation_exists = (
+            select(DocumentIndexGeneration.id)
+            .where(
+                DocumentIndexGeneration.document_id == Document.id,
+                DocumentIndexGeneration.source_document_sha256 == Document.content_sha256,
+                DocumentIndexGeneration.embedding_profile_id
+                == settings.ai_embedding_profile_id,
+                DocumentIndexGeneration.chunking_version == CHUNKING_VERSION,
+                DocumentIndexGeneration.status == "ready",
+            )
+            .exists()
+        )
         documents = list(
             session.scalars(
                 select(Document)
@@ -161,6 +173,7 @@ def reconcile_missing_indexes(
                     Document.has_extractable_text.is_(True),
                     Subject.archived_at.is_(None),
                     StudySpace.archived_at.is_(None),
+                    ~current_ready_generation_exists,
                 )
                 .order_by(Document.processed_at, Document.id)
                 .limit(limit)
