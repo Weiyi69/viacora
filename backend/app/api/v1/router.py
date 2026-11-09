@@ -8,6 +8,7 @@ from app.api.v1.routes import (
     documents,
     health,
     study_spaces,
+    study_kits,
     subjects,
     topics,
     users,
@@ -18,6 +19,7 @@ api_router.include_router(health.router, tags=["health"])
 api_router.include_router(dashboard.router)
 api_router.include_router(subjects.router)
 api_router.include_router(study_spaces.router)
+api_router.include_router(study_kits.router)
 api_router.include_router(topics.router)
 api_router.include_router(activity.router)
 api_router.include_router(ai.router)

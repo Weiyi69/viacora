@@ -69,6 +69,69 @@ def _active_profile(session: Session, settings: Settings) -> AIEmbeddingProfile:
     return profile
 
 
+def _lock_generation_then_job(
+    session: Session,
+    *,
+    generation_id: UUID,
+    document_id: UUID,
+    job_id: UUID | None = None,
+) -> tuple[DocumentIndexGeneration | None, DocumentIndexJob | None]:
+    generation = session.scalar(
+        select(DocumentIndexGeneration)
+        .where(
+            DocumentIndexGeneration.id == generation_id,
+            DocumentIndexGeneration.document_id == document_id,
+        )
+        .with_for_update()
+    )
+    if generation is None:
+        return None, None
+
+    job_query = select(DocumentIndexJob).where(
+        DocumentIndexJob.generation_id == generation.id,
+        DocumentIndexJob.document_id == document_id,
+    )
+    if job_id is not None:
+        job_query = job_query.where(DocumentIndexJob.id == job_id)
+    job = session.scalar(job_query.order_by(DocumentIndexJob.id).with_for_update())
+    return generation, job
+
+
+def _mark_exhausted_generation_failed(
+    session_factory: sessionmaker[Session],
+    *,
+    document_id: UUID,
+    generation_id: UUID,
+    job_id: UUID,
+) -> None:
+    with session_factory() as session:
+        generation, job = _lock_generation_then_job(
+            session,
+            generation_id=generation_id,
+            document_id=document_id,
+            job_id=job_id,
+        )
+        if (
+            generation is not None
+            and job is not None
+            and generation.document_id == document_id
+            and generation.id == generation_id
+            and job.id == job_id
+            and job.document_id == document_id
+            and job.generation_id == generation_id
+            and job.status == "failed"
+            and job.attempts_used == MAX_INDEX_ATTEMPTS
+            and job.lease_token is None
+            and job.lease_expires_at is None
+            and job.next_attempt_at is None
+            and job.completed_at is not None
+            and generation.status == "building"
+        ):
+            generation.status = "failed"
+            generation.error_code = "attempts_exhausted"
+            session.commit()
+
+
 def ensure_index_generation(
     session: Session,
     document: Document,
@@ -87,7 +150,6 @@ def ensure_index_generation(
             DocumentIndexGeneration.embedding_profile_id == profile.profile_id,
             DocumentIndexGeneration.chunking_version == CHUNKING_VERSION,
         )
-        .with_for_update()
     )
     if generation is None:
         generation_number = (
@@ -113,11 +175,13 @@ def ensure_index_generation(
         )
         session.add(generation)
         session.flush()
-    job = session.scalar(
-        select(DocumentIndexJob)
-        .where(DocumentIndexJob.generation_id == generation.id)
-        .with_for_update()
+    generation, job = _lock_generation_then_job(
+        session,
+        generation_id=generation.id,
+        document_id=document.id,
     )
+    if generation is None:
+        return None
     if job is None:
         session.add(
             DocumentIndexJob(
@@ -243,15 +307,22 @@ def _claim_index_job(session_factory: sessionmaker[Session]) -> IndexLease | Non
         if job is None:
             return None
         if job.attempts_used >= MAX_INDEX_ATTEMPTS:
+            document_id = job.document_id
+            generation_id = job.generation_id
+            job_id = job.id
             job.status = "failed"
             job.error_code = "attempts_exhausted"
             job.lease_token = None
             job.lease_expires_at = None
-            generation = session.get(DocumentIndexGeneration, job.generation_id)
-            if generation is not None:
-                generation.status = "failed"
-                generation.error_code = "attempts_exhausted"
+            job.next_attempt_at = None
+            job.completed_at = now
             session.commit()
+            _mark_exhausted_generation_failed(
+                session_factory,
+                document_id=document_id,
+                generation_id=generation_id,
+                job_id=job_id,
+            )
             return None
 
         document = session.get(Document, job.document_id)
@@ -475,21 +546,7 @@ def _embed_batch(
 def _activate_generation(
     session_factory: sessionmaker[Session], lease: IndexLease, expected_count: int
 ) -> bool:
-    now = datetime.now(timezone.utc)
     with session_factory() as session:
-        job = session.scalar(
-            select(DocumentIndexJob)
-            .where(DocumentIndexJob.id == lease.job_id)
-            .with_for_update()
-        )
-        if (
-            job is None
-            or job.status != "processing"
-            or job.lease_token != lease.token
-            or job.lease_expires_at is None
-            or job.lease_expires_at <= now
-        ):
-            return False
         document = session.scalar(
             select(Document)
             .where(
@@ -498,9 +555,27 @@ def _activate_generation(
                 Document.status == "completed",
                 Document.has_extractable_text.is_(True),
             )
-            .with_for_update()
+            .with_for_update(of=Document)
         )
         if document is None:
+            return False
+        head = session.scalar(
+            select(DocumentIndexHead)
+            .where(DocumentIndexHead.document_id == document.id)
+            .with_for_update()
+        )
+        generation, job = _lock_generation_then_job(
+            session,
+            generation_id=lease.generation_id,
+            document_id=document.id,
+            job_id=lease.job_id,
+        )
+        if (
+            generation is None
+            or job is None
+            or job.status != "processing"
+            or job.lease_token != lease.token
+        ):
             return False
         subject = session.scalar(
             select(Subject)
@@ -509,7 +584,6 @@ def _activate_generation(
                 Subject.user_id == document.user_id,
                 Subject.archived_at.is_(None),
             )
-            .with_for_update()
         )
         study_space = session.scalar(
             select(StudySpace)
@@ -518,18 +592,17 @@ def _activate_generation(
                 StudySpace.subject_id == document.subject_id,
                 StudySpace.archived_at.is_(None),
             )
-            .with_for_update()
         )
-        generation = session.scalar(
-            select(DocumentIndexGeneration)
-            .where(DocumentIndexGeneration.id == lease.generation_id)
-            .with_for_update()
-        )
+        now = datetime.now(timezone.utc)
         if (
             subject is None
             or study_space is None
             or generation is None
+            or generation.status != "building"
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
             or generation.source_document_sha256 != document.content_sha256
+            or generation.chunking_version != CHUNKING_VERSION
         ):
             return False
         actual_count = session.scalar(
@@ -546,7 +619,10 @@ def _activate_generation(
             raise RuntimeError("Index generation is incomplete")
         settings = get_settings()
         profile = _active_profile(session, settings)
-        if generation.embedding_profile_id != profile.profile_id:
+        if (
+            generation.embedding_profile_id != profile.profile_id
+            or (head is not None and head.profile_id != profile.profile_id)
+        ):
             return False
         latest_generation = session.scalar(
             select(func.max(DocumentIndexGeneration.generation_number)).where(
@@ -556,10 +632,12 @@ def _activate_generation(
         if generation.generation_number != latest_generation:
             return False
 
+        now = datetime.now(timezone.utc)
+        if job.lease_expires_at is None or job.lease_expires_at <= now:
+            return False
         generation.status = "ready"
         generation.ready_at = now
         generation.error_code = None
-        head = session.get(DocumentIndexHead, document.id, with_for_update=True)
         if head is None:
             session.add(
                 DocumentIndexHead(
@@ -587,19 +665,33 @@ def _record_index_failure(
     *,
     retryable: bool,
 ) -> None:
-    now = datetime.now(timezone.utc)
     settings = get_settings()
     with session_factory() as session:
-        job = session.scalar(
-            select(DocumentIndexJob)
-            .where(
+        snapshot = session.scalar(
+            select(DocumentIndexJob.generation_id).where(
                 DocumentIndexJob.id == lease.job_id,
+                DocumentIndexJob.document_id == lease.document_id,
                 DocumentIndexJob.status == "processing",
                 DocumentIndexJob.lease_token == lease.token,
             )
-            .with_for_update()
         )
-        if job is None:
+        if snapshot is None:
+            return
+        generation, job = _lock_generation_then_job(
+            session,
+            generation_id=snapshot,
+            document_id=lease.document_id,
+            job_id=lease.job_id,
+        )
+        now = datetime.now(timezone.utc)
+        if (
+            generation is None
+            or job is None
+            or job.status != "processing"
+            or job.lease_token != lease.token
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
+        ):
             return
         should_retry = retryable and job.attempts_used < MAX_INDEX_ATTEMPTS
         job.status = "queued" if should_retry else "failed"
@@ -618,11 +710,6 @@ def _record_index_failure(
         )
         job.lease_token = None
         job.lease_expires_at = None
-        generation = session.scalar(
-            select(DocumentIndexGeneration)
-            .where(DocumentIndexGeneration.id == job.generation_id)
-            .with_for_update()
-        )
         if generation is not None and not should_retry:
             generation.status = "failed"
             generation.error_code = error_code
@@ -683,7 +770,6 @@ def _lease_still_current(session_factory: sessionmaker[Session], lease: IndexLea
 
 def _defer_index_job(session_factory: sessionmaker[Session], lease: IndexLease) -> None:
     settings = get_settings()
-    now = datetime.now(timezone.utc)
     with session_factory() as session:
         job = session.scalar(
             select(DocumentIndexJob)
@@ -694,7 +780,12 @@ def _defer_index_job(session_factory: sessionmaker[Session], lease: IndexLease) 
             )
             .with_for_update()
         )
-        if job is None:
+        now = datetime.now(timezone.utc)
+        if (
+            job is None
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
+        ):
             return
         job.status = "queued"
         job.attempts_used = max(0, job.attempts_used - 1)

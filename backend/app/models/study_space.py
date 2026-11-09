@@ -52,6 +52,11 @@ class StudySpace(Base):
     topics: Mapped[list["Topic"]] = relationship(
         back_populates="study_space", cascade="all, delete-orphan"
     )
+    study_kits: Mapped[list["StudyKit"]] = relationship(
+        back_populates="study_space",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     learning_activities: Mapped[list["LearningActivity"]] = relationship(
         back_populates="study_space",
         cascade="all, delete-orphan",

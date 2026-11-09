@@ -18,6 +18,7 @@ from app.services.document_indexing import (
     reconcile_missing_indexes,
 )
 from app.services.ai_usage_reservations import recover_expired_reservations
+from app.services.study_material_jobs import recover_expired_study_material_jobs
 from app.services.pdf_extraction import (
     PermanentPdfError,
     StaleDocumentLease,
@@ -147,6 +148,16 @@ def _revoke_lease(document: Document) -> None:
     document.lease_expires_at = None
 
 
+def _lease_is_expired(lease_expires_at: datetime | None, now: datetime) -> bool:
+    if lease_expires_at is None:
+        return True
+    if lease_expires_at.tzinfo is None:
+        lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+    else:
+        lease_expires_at = lease_expires_at.astimezone(timezone.utc)
+    return lease_expires_at <= now
+
+
 def _renew_lease(session_factory: sessionmaker[Session], lease: DocumentLease) -> bool:
     settings = get_settings()
     with session_factory() as session:
@@ -160,12 +171,16 @@ def _renew_lease(session_factory: sessionmaker[Session], lease: DocumentLease) -
             )
             .with_for_update()
         )
-        if not parents_active or document is None:
-            if document is not None:
-                _revoke_lease(document)
-                session.commit()
+        if document is None:
             return False
-        document.lease_expires_at = datetime.now(timezone.utc) + timedelta(
+        now = datetime.now(timezone.utc)
+        if not parents_active:
+            _revoke_lease(document)
+            session.commit()
+            return False
+        if _lease_is_expired(document.lease_expires_at, now):
+            return False
+        document.lease_expires_at = now + timedelta(
             seconds=settings.document_worker_lease_seconds
         )
         session.commit()
@@ -178,7 +193,6 @@ def _publish_result(
     pages: list[str],
     has_text: bool,
 ) -> None:
-    now = datetime.now(timezone.utc)
     with session_factory() as session:
         parents_active = _lock_parents(session, lease)
         document = session.scalar(
@@ -191,6 +205,9 @@ def _publish_result(
             .with_for_update()
         )
         if document is None:
+            return
+        now = datetime.now(timezone.utc)
+        if _lease_is_expired(document.lease_expires_at, now):
             return
         if not parents_active:
             _revoke_lease(document)
@@ -208,12 +225,16 @@ def _publish_result(
         document.retryable = False
         document.error_code = None
         document.next_attempt_at = None
-        document.lease_token = None
-        document.lease_expires_at = None
-        document.processed_at = now
         settings = get_settings()
         if has_text and settings.ai_enabled:
             ensure_index_generation(session, document, settings=settings)
+        now = datetime.now(timezone.utc)
+        if _lease_is_expired(document.lease_expires_at, now):
+            session.rollback()
+            return
+        document.lease_token = None
+        document.lease_expires_at = None
+        document.processed_at = now
         session.commit()
 
 
@@ -224,7 +245,6 @@ def _record_failure(
     error_code: str,
     retryable: bool,
 ) -> None:
-    now = datetime.now(timezone.utc)
     with session_factory() as session:
         parents_active = _lock_parents(session, lease)
         document = session.scalar(
@@ -237,6 +257,9 @@ def _record_failure(
             .with_for_update()
         )
         if document is None:
+            return
+        now = datetime.now(timezone.utc)
+        if _lease_is_expired(document.lease_expires_at, now):
             return
         if not parents_active:
             _revoke_lease(document)
@@ -372,6 +395,7 @@ def run_worker(
             try:
                 reconcile_missing_indexes(session_factory)
                 recover_expired_reservations(session_factory)
+                recover_expired_study_material_jobs(session_factory)
             except SQLAlchemyError:
                 logger.exception("AI indexing or usage reconciliation failed")
             last_ai_recovery = time.monotonic()

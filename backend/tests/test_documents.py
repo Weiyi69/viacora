@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from io import BytesIO
@@ -7,11 +8,20 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
+import pytest
+from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.models import Document
 from app.services.database import get_session_factory
-from app.services.document_worker import process_next_document
+from app.services import document_worker
+from app.services.document_worker import (
+    DocumentLease,
+    _publish_result,
+    _record_failure,
+    _renew_lease,
+    process_next_document,
+)
 from app.services.document_storage import storage_path
 from app.services.pdf_extraction import PermanentPdfError, extract_pdf_pages
 
@@ -132,6 +142,147 @@ def upload_pdf(
             )
         },
     )
+
+
+def create_processing_lease(
+    client: TestClient,
+    email: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    lease_expires_at: datetime | None = None,
+) -> tuple[sessionmaker[Session], DocumentLease, UUID]:
+    monkeypatch.setenv("DOCUMENT_STORAGE_PATH", str(tmp_path / "private-documents"))
+    monkeypatch.setattr(
+        document_worker,
+        "get_settings",
+        lambda: Settings(_env_file=None, environment="test"),
+    )
+    sign_in(client, email)
+    subject_id, study_space_id = create_learning_space(client)
+    uploaded = upload_pdf(client, subject_id, study_space_id)
+    assert uploaded.status_code == 201, uploaded.text
+
+    document_id = UUID(uploaded.json()["id"])
+    token = uuid4()
+    expires_at = lease_expires_at or datetime.now(timezone.utc) + timedelta(minutes=5)
+    factory = get_session_factory()
+    with factory() as session:
+        document = session.get(Document, document_id)
+        assert document is not None
+        document.status = "processing"
+        document.attempts_used = 1
+        document.lease_token = token
+        document.lease_expires_at = expires_at
+        session.commit()
+
+    with factory() as session:
+        document = session.get(Document, document_id)
+        assert document is not None
+        assert document.lease_expires_at is not None
+        assert document.lease_expires_at.tzinfo is None
+        lease = DocumentLease(
+            document_id=document.id,
+            user_id=document.user_id,
+            subject_id=document.subject_id,
+            study_space_id=document.study_space_id,
+            storage_key=document.storage_key,
+            token=token,
+            attempts_used=document.attempts_used,
+        )
+    return factory, lease, document_id
+
+
+def test_renew_lease_accepts_naive_sqlite_expiration(
+    auth_client: TestClient, monkeypatch, tmp_path: Path
+) -> None:
+    factory, lease, document_id = create_processing_lease(
+        auth_client, "renew-naive-lease@example.com", monkeypatch, tmp_path
+    )
+
+    assert _renew_lease(factory, lease) is True
+    with factory() as session:
+        document = session.get(Document, document_id)
+        assert document is not None
+        assert document.lease_expires_at is not None
+        assert document.lease_expires_at.tzinfo is None
+        assert document.lease_expires_at > datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def test_publish_result_accepts_naive_sqlite_expiration(
+    auth_client: TestClient, monkeypatch, tmp_path: Path
+) -> None:
+    factory, lease, document_id = create_processing_lease(
+        auth_client, "publish-naive-lease@example.com", monkeypatch, tmp_path
+    )
+
+    _publish_result(factory, lease, ["published from SQLite"], has_text=False)
+    with factory() as session:
+        document = session.get(Document, document_id)
+        assert document is not None
+        assert document.status == "completed"
+        assert document.lease_token is None
+        assert [(page.page_number, page.extracted_text) for page in document.pages] == [
+            (1, "published from SQLite")
+        ]
+
+
+def test_record_failure_accepts_naive_sqlite_expiration_and_schedules_retry(
+    auth_client: TestClient, monkeypatch, tmp_path: Path
+) -> None:
+    factory, lease, document_id = create_processing_lease(
+        auth_client, "retry-naive-lease@example.com", monkeypatch, tmp_path
+    )
+
+    _record_failure(factory, lease, error_code="temporary_error", retryable=True)
+    with factory() as session:
+        document = session.get(Document, document_id)
+        assert document is not None
+        assert document.status == "queued"
+        assert document.retryable is True
+        assert document.error_code == "temporary_error"
+        assert document.next_attempt_at is not None
+        assert document.next_attempt_at.tzinfo is None
+        assert document.lease_token is None
+
+
+def test_expired_and_boundary_equal_sqlite_leases_are_rejected(
+    auth_client: TestClient, monkeypatch, tmp_path: Path
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is timezone.utc else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(document_worker, "datetime", FrozenDateTime)
+    factory, lease, document_id = create_processing_lease(
+        auth_client,
+        "expired-naive-lease@example.com",
+        monkeypatch,
+        tmp_path,
+        lease_expires_at=now,
+    )
+
+    for expiration in (now - timedelta(seconds=1), now):
+        with factory() as session:
+            document = session.get(Document, document_id)
+            assert document is not None
+            document.status = "processing"
+            document.attempts_used = 1
+            document.lease_token = lease.token
+            document.lease_expires_at = expiration
+            session.commit()
+
+        assert _renew_lease(factory, lease) is False
+        _publish_result(factory, lease, ["must not publish"], has_text=False)
+        _record_failure(factory, lease, error_code="stale", retryable=True)
+        with factory() as session:
+            document = session.get(Document, document_id)
+            assert document is not None
+            assert document.status == "processing"
+            assert document.lease_token == lease.token
 
 
 def test_upload_archive_restore_and_worker_processes_private_pdf(

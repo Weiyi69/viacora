@@ -22,7 +22,7 @@ def get_active_document(
         )
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update(of=Document)
     return session.scalar(statement)
 
 
@@ -34,7 +34,7 @@ def get_document(
         Document.user_id == user_id,
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update(of=Document)
     return session.scalar(statement)
 
 

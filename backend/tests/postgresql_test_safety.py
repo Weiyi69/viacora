@@ -1,9 +1,10 @@
+import ipaddress
 import re
 
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_TEST_DATABASE_NAME = "viacora_isolated_test"
 _PRODUCTION_NAME = re.compile(r"(^|[_-])(prod|production|live)([_-]|$)", re.IGNORECASE)
 
 
@@ -32,7 +33,14 @@ def _parse_postgresql_url(
 
 def _normalized_host(host: str) -> str:
     normalized = host.lower().strip("[]")
-    return "localhost" if normalized in _LOCAL_HOSTS else normalized
+    if normalized == "localhost":
+        return "localhost"
+    try:
+        if ipaddress.ip_address(normalized).is_loopback:
+            return "localhost"
+    except ValueError:
+        pass
+    return normalized
 
 
 def _target(url: URL) -> tuple[str, int, str]:
@@ -52,22 +60,29 @@ def validate_ai_test_database_url(
 
     if host != "localhost":
         raise ValueError("AI_TEST_DATABASE_URL must target localhost, 127.0.0.1, or ::1")
+    if (test_url.port or 5432) != 5432:
+        raise ValueError("AI_TEST_DATABASE_URL must use port 5432")
     if database_name.lower() == "viacora_dev":
         raise ValueError("AI_TEST_DATABASE_URL must not target viacora_dev")
+    if database_name.lower() == "viacora_test":
+        raise ValueError("AI_TEST_DATABASE_URL must not target viacora_test")
     if _PRODUCTION_NAME.search(database_name) or (
         test_url.username and _PRODUCTION_NAME.search(test_url.username)
     ):
         raise ValueError("AI_TEST_DATABASE_URL must not use a production-like name")
-    if not database_name.lower().endswith("_test"):
-        raise ValueError("AI_TEST_DATABASE_URL database name must end in _test")
-
-    if configured_database_url and configured_database_url.strip():
-        configured_url = _parse_postgresql_url(
-            configured_database_url.strip(),
-            label="DATABASE_URL",
-            require_psycopg_driver=False,
+    if database_name != _TEST_DATABASE_NAME:
+        raise ValueError(
+            f"AI_TEST_DATABASE_URL must target {_TEST_DATABASE_NAME}"
         )
-        if _target(test_url) == _target(configured_url):
-            raise ValueError("AI_TEST_DATABASE_URL must differ from DATABASE_URL")
+
+    if not configured_database_url or not configured_database_url.strip():
+        raise ValueError("DATABASE_URL must be explicitly configured")
+    configured_url = _parse_postgresql_url(
+        configured_database_url.strip(),
+        label="DATABASE_URL",
+        require_psycopg_driver=False,
+    )
+    if _target(test_url) == _target(configured_url):
+        raise ValueError("AI_TEST_DATABASE_URL must differ from DATABASE_URL")
 
     return test_url

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
     text,
@@ -59,6 +60,12 @@ class Document(Base):
         Index("ix_documents_space_status_created", "study_space_id", "status", "created_at"),
         Index("ix_documents_topic", "topic_id"),
         Index("ix_documents_queue", "status", "next_attempt_at", "lease_expires_at"),
+        UniqueConstraint(
+            "user_id",
+            "study_space_id",
+            "id",
+            name="uq_documents_user_space_id",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)

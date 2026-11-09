@@ -25,6 +25,7 @@ from app.services.document_storage import (
     store_upload,
     storage_path,
 )
+from app.services.study_material_jobs import delete_document_dependent_work
 from app.services.study_spaces import get_study_space
 from app.services.subjects import get_subject
 from app.services.topics import get_topic
@@ -156,6 +157,25 @@ async def upload_document(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Document storage quota exceeded",
             )
+        get_subject(session, user_id=user_id, subject_id=subject_id, lock=True)
+        study_space = get_study_space(
+            session,
+            user_id=user_id,
+            study_space_id=study_space_id,
+            lock=True,
+        )
+        if study_space.subject_id != subject_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Study space does not belong to the requested subject",
+            )
+        _validate_hierarchy(
+            session,
+            user_id=user_id,
+            subject_id=subject_id,
+            study_space_id=study_space_id,
+            topic_id=topic_id,
+        )
         document = Document(
             user_id=user_id,
             subject_id=subject_id,
@@ -183,6 +203,15 @@ async def upload_document(
         ) from error
     except HTTPException:
         session.rollback()
+        if "storage_key" in locals():
+            try:
+                remove_storage_file(storage_key)
+            except OSError as error:
+                logger.exception("Could not remove unreferenced document file")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Upload cleanup failed",
+                ) from error
         raise
     except SQLAlchemyError:
         session.rollback()
@@ -326,6 +355,7 @@ def delete_document(session: Session, *, user_id: UUID, document_id: UUID) -> No
     if document is None:
         raise _not_found()
     storage_key = document.storage_key
+    delete_document_dependent_work(session, [document.id])
     session.delete(document)
     try:
         session.commit()

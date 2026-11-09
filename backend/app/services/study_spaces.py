@@ -2,14 +2,19 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.models import LearningActivity, StudySpace
+from app.models import Document, LearningActivity, StudySpace
 from app.repositories import documents as document_repository
 from app.repositories import study_spaces as study_space_repository
 from app.schemas.learning import StudySpaceCreate, StudySpaceUpdate
 from app.services.document_storage import remove_storage_files
+from app.services.study_material_jobs import (
+    cancel_jobs_selected_by_documents,
+    delete_document_dependent_work,
+)
 from app.services.subjects import get_subject
 
 
@@ -54,13 +59,18 @@ def get_study_space(
     lock: bool = False,
 ) -> StudySpace:
     study_space = study_space_repository.get_study_space(
-        session, user_id=user_id, study_space_id=study_space_id, lock=lock
+        session, user_id=user_id, study_space_id=study_space_id
     )
     if study_space is None:
         raise _not_found()
-    _require_active_parent(
-        session, user_id=user_id, subject_id=study_space.subject_id
-    )
+    if lock:
+        get_subject(session, user_id=user_id, subject_id=study_space.subject_id, lock=True)
+        study_space = study_space_repository.get_study_space(
+            session, user_id=user_id, study_space_id=study_space_id, lock=True
+        )
+        if study_space is None:
+            raise _not_found()
+    _require_active_parent(session, user_id=user_id, subject_id=study_space.subject_id)
     if study_space.archived_at is not None and not allow_archived:
         raise _not_found()
     return study_space
@@ -73,7 +83,7 @@ def create_study_space(
     subject_id: UUID,
     payload: StudySpaceCreate,
 ) -> StudySpace:
-    _require_active_parent(session, user_id=user_id, subject_id=subject_id)
+    get_subject(session, user_id=user_id, subject_id=subject_id, lock=True)
     study_space = study_space_repository.create_study_space(
         session,
         subject_id=subject_id,
@@ -130,6 +140,14 @@ def archive_study_space(
     )
     if study_space.archived_at is None:
         study_space.archived_at = datetime.now(timezone.utc)
+        document_ids = list(
+            session.scalars(
+                select(Document.id)
+                .where(Document.study_space_id == study_space_id)
+                .order_by(Document.id)
+            )
+        )
+        cancel_jobs_selected_by_documents(session, document_ids)
         document_repository.revoke_processing_for_parent(
             session, study_space_id=study_space_id
         )
@@ -150,6 +168,7 @@ def restore_study_space(
         user_id=user_id,
         study_space_id=study_space_id,
         allow_archived=True,
+        lock=True,
     )
     if study_space.archived_at is not None:
         study_space.archived_at = None
@@ -165,6 +184,17 @@ def restore_study_space(
 def delete_study_space(
     session: Session, *, user_id: UUID, study_space_id: UUID
 ) -> None:
+    space_snapshot = study_space_repository.get_study_space(
+        session, user_id=user_id, study_space_id=study_space_id
+    )
+    if space_snapshot is None:
+        raise _not_found()
+    get_subject(
+        session,
+        user_id=user_id,
+        subject_id=space_snapshot.subject_id,
+        lock=True,
+    )
     study_space = get_study_space(
         session,
         user_id=user_id,
@@ -174,6 +204,14 @@ def delete_study_space(
     storage_keys = document_repository.storage_keys_for_parent(
         session, study_space_id=study_space_id
     )
+    document_ids = list(
+        session.scalars(
+            select(Document.id)
+            .where(Document.study_space_id == study_space_id)
+            .order_by(Document.id)
+        )
+    )
+    delete_document_dependent_work(session, document_ids)
     session.delete(study_space)
     try:
         session.commit()

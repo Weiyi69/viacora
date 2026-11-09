@@ -2,7 +2,7 @@ from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,7 +10,14 @@ from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
-from app.models import LearningActivity, StudySpace, Subject, Topic
+from app.models import (
+    LearningActivity,
+    StudyMaterial,
+    StudyMaterialJob,
+    StudySpace,
+    Subject,
+    Topic,
+)
 from app.schemas.learning import SubjectCreate
 from app.services.subjects import create_subject as create_subject_service
 from app.services.database import get_session_factory
@@ -81,6 +88,9 @@ def test_learning_endpoints_require_authentication(auth_client: TestClient) -> N
         "/api/v1/subjects",
         headers=csrf_headers(auth_client),
         json={"name": "Private"},
+    ).status_code == 401
+    assert auth_client.get(
+        f"/api/v1/study-spaces/{uuid4()}/study-kits"
     ).status_code == 401
 
 
@@ -248,12 +258,27 @@ def test_cross_user_resource_access_is_hidden(auth_client: TestClient) -> None:
         headers=csrf_headers(auth_client),
         json={"name": "Private topic"},
     ).json()
+    kit = auth_client.post(
+        f"/api/v1/study-spaces/{space['id']}/study-kits",
+        headers=csrf_headers(auth_client),
+        json={"title": "Private kit"},
+    ).json()
     auth_client.post("/api/v1/auth/logout", headers=csrf_headers(auth_client))
 
     sign_in(auth_client, "second@example.com")
     assert auth_client.get(f"/api/v1/subjects/{subject['id']}").status_code == 404
     assert auth_client.get(f"/api/v1/study-spaces/{space['id']}").status_code == 404
     assert auth_client.get(f"/api/v1/topics/{topic['id']}").status_code == 404
+    assert auth_client.get(f"/api/v1/study-kits/{kit['id']}").status_code == 404
+    assert auth_client.patch(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers=csrf_headers(auth_client),
+        json={"title": "Taken over"},
+    ).status_code == 404
+    assert auth_client.delete(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers=csrf_headers(auth_client),
+    ).status_code == 404
     assert auth_client.patch(
         f"/api/v1/subjects/{subject['id']}",
         headers=csrf_headers(auth_client),
@@ -263,6 +288,165 @@ def test_cross_user_resource_access_is_hidden(auth_client: TestClient) -> None:
         f"/api/v1/study-spaces/{space['id']}",
         headers=csrf_headers(auth_client),
     ).status_code == 404
+
+
+def test_study_kit_crud_archive_restore_and_validation(
+    auth_client: TestClient,
+) -> None:
+    sign_in(auth_client)
+    subject = create_subject(auth_client)
+    space = auth_client.post(
+        f"/api/v1/subjects/{subject['id']}/study-spaces",
+        headers=csrf_headers(auth_client),
+        json={"name": "Cardiology"},
+    ).json()
+    endpoint = f"/api/v1/study-spaces/{space['id']}/study-kits"
+
+    created = auth_client.post(
+        endpoint,
+        headers=csrf_headers(auth_client),
+        json={"title": "Heart failure", "description": "Review core concepts"},
+    )
+    assert created.status_code == 201, created.text
+    kit = created.json()
+    assert kit["study_space_id"] == space["id"]
+    assert kit["subject_id"] == subject["id"]
+    assert kit["title"] == "Heart failure"
+
+    page = auth_client.get(endpoint)
+    assert page.status_code == 200
+    assert page.json()["total"] == 1
+    assert page.json()["items"][0]["id"] == kit["id"]
+
+    updated = auth_client.patch(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers=csrf_headers(auth_client),
+        json={"title": "Heart failure overview", "description": None},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["title"] == "Heart failure overview"
+    assert updated.json()["description"] is None
+    assert auth_client.patch(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers=csrf_headers(auth_client),
+        json={},
+    ).status_code == 422
+    assert auth_client.post(
+        endpoint,
+        headers=csrf_headers(auth_client),
+        json={"title": "   "},
+    ).status_code == 422
+
+    archived = auth_client.post(
+        f"/api/v1/study-kits/{kit['id']}/archive",
+        headers=csrf_headers(auth_client),
+    )
+    assert archived.status_code == 200
+    assert archived.json()["archived_at"] is not None
+    assert auth_client.get(f"/api/v1/study-kits/{kit['id']}").status_code == 404
+    assert auth_client.get(endpoint).json()["total"] == 0
+    archived_page = auth_client.get(f"{endpoint}?include_archived=true")
+    assert archived_page.json()["total"] == 1
+    assert archived_page.json()["items"][0]["id"] == kit["id"]
+
+    restored = auth_client.post(
+        f"/api/v1/study-kits/{kit['id']}/restore",
+        headers=csrf_headers(auth_client),
+    )
+    assert restored.status_code == 200
+    assert restored.json()["archived_at"] is None
+    assert auth_client.get(f"/api/v1/study-kits/{kit['id']}").status_code == 200
+
+    assert auth_client.delete(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers=csrf_headers(auth_client),
+    ).status_code == 204
+    assert auth_client.get(f"/api/v1/study-kits/{kit['id']}").status_code == 404
+
+
+def test_study_kit_archive_preserves_content_and_delete_cascades(
+    auth_client: TestClient,
+) -> None:
+    sign_in(auth_client)
+    subject = create_subject(auth_client, "Anatomy")
+    other_subject = create_subject(auth_client, "Physiology")
+    first_space = auth_client.post(
+        f"/api/v1/subjects/{subject['id']}/study-spaces",
+        headers=csrf_headers(auth_client),
+        json={"name": "Cardiovascular"},
+    ).json()
+    second_space = auth_client.post(
+        f"/api/v1/subjects/{other_subject['id']}/study-spaces",
+        headers=csrf_headers(auth_client),
+        json={"name": "Respiratory"},
+    ).json()
+    user_id = UUID(auth_client.get("/api/v1/auth/session").json()["user"]["id"])
+    first_space_kits = auth_client.get(
+        f"/api/v1/study-spaces/{first_space['id']}/study-kits"
+    )
+    second_space_kits = auth_client.get(
+        f"/api/v1/study-spaces/{second_space['id']}/study-kits"
+    )
+    assert first_space_kits.status_code == second_space_kits.status_code == 200
+    assert first_space_kits.json()["total"] == 0
+    assert second_space_kits.json()["total"] == 0
+
+    kit_response = auth_client.post(
+        f"/api/v1/study-spaces/{first_space['id']}/study-kits",
+        headers=csrf_headers(auth_client),
+        json={"title": "Cardiac notes"},
+    )
+    assert kit_response.status_code == 201, kit_response.text
+    kit_id = UUID(kit_response.json()["id"])
+    job_id = uuid4()
+    material_id = uuid4()
+    with get_session_factory()() as session:
+        session.add(
+            StudyMaterialJob(
+                id=job_id,
+                user_id=user_id,
+                study_space_id=UUID(first_space["id"]),
+                study_kit_id=kit_id,
+                kind="notes",
+                status="queued",
+                attempts_used=0,
+                idempotency_key="test-notes-job",
+                request_hash="a" * 64,
+                request_payload={},
+            )
+        )
+        session.flush()
+        session.add(
+            StudyMaterial(
+                id=material_id,
+                user_id=user_id,
+                study_kit_id=kit_id,
+                job_id=job_id,
+                kind="notes",
+                schema_version=1,
+                version_number=1,
+                title="Cardiac notes",
+                content={"sections": []},
+            )
+        )
+        session.commit()
+
+    archived = auth_client.post(
+        f"/api/v1/study-kits/{kit_id}/archive",
+        headers=csrf_headers(auth_client),
+    )
+    assert archived.status_code == 200
+    with get_session_factory()() as session:
+        assert session.get(StudyMaterialJob, job_id) is not None
+        assert session.get(StudyMaterial, material_id) is not None
+
+    assert auth_client.delete(
+        f"/api/v1/study-kits/{kit_id}",
+        headers=csrf_headers(auth_client),
+    ).status_code == 204
+    with get_session_factory()() as session:
+        assert session.get(StudyMaterialJob, job_id) is None
+        assert session.get(StudyMaterial, material_id) is None
 
 
 def test_access_events_are_explicit_deduplicated_and_deleted_with_resources(
@@ -348,6 +532,35 @@ def test_creation_and_mutation_require_csrf(auth_client: TestClient) -> None:
         "/api/v1/subjects",
         headers={"Origin": TRUSTED_ORIGIN},
         json={"name": "No CSRF"},
+    ).status_code == 403
+    subject = create_subject(auth_client)
+    space = auth_client.post(
+        f"/api/v1/subjects/{subject['id']}/study-spaces",
+        headers=csrf_headers(auth_client),
+        json={"name": "Secure space"},
+    ).json()
+    assert auth_client.post(
+        f"/api/v1/study-spaces/{space['id']}/study-kits",
+        headers={"Origin": TRUSTED_ORIGIN},
+        json={"title": "No CSRF"},
+    ).status_code == 403
+    kit = auth_client.post(
+        f"/api/v1/study-spaces/{space['id']}/study-kits",
+        headers=csrf_headers(auth_client),
+        json={"title": "Protected kit"},
+    ).json()
+    assert auth_client.patch(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers={"Origin": TRUSTED_ORIGIN},
+        json={"title": "No CSRF"},
+    ).status_code == 403
+    assert auth_client.post(
+        f"/api/v1/study-kits/{kit['id']}/archive",
+        headers={"Origin": TRUSTED_ORIGIN},
+    ).status_code == 403
+    assert auth_client.delete(
+        f"/api/v1/study-kits/{kit['id']}",
+        headers={"Origin": TRUSTED_ORIGIN},
     ).status_code == 403
     preflight = auth_client.options(
         "/api/v1/subjects/resource-id",

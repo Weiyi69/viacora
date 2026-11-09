@@ -2,14 +2,19 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.models import LearningActivity, Subject
+from app.models import Document, LearningActivity, StudySpace, Subject
 from app.repositories import documents as document_repository
 from app.repositories import subjects as subject_repository
 from app.schemas.learning import SubjectCreate, SubjectUpdate
 from app.services.document_storage import remove_storage_files
+from app.services.study_material_jobs import (
+    cancel_jobs_selected_by_documents,
+    delete_document_dependent_work,
+)
 
 
 def _not_found() -> HTTPException:
@@ -111,6 +116,14 @@ def archive_subject(session: Session, *, user_id: UUID, subject_id: UUID) -> Sub
     )
     if subject.archived_at is None:
         subject.archived_at = datetime.now(timezone.utc)
+        document_ids = list(
+            session.scalars(
+                select(Document.id)
+                .where(Document.subject_id == subject_id)
+                .order_by(Document.id)
+            )
+        )
+        cancel_jobs_selected_by_documents(session, document_ids)
         document_repository.revoke_processing_for_parent(
             session, subject_id=subject_id
         )
@@ -140,11 +153,27 @@ def restore_subject(session: Session, *, user_id: UUID, subject_id: UUID) -> Sub
 
 def delete_subject(session: Session, *, user_id: UUID, subject_id: UUID) -> None:
     subject = get_subject(
-        session, user_id=user_id, subject_id=subject_id, allow_archived=True
+        session, user_id=user_id, subject_id=subject_id, allow_archived=True, lock=True
+    )
+    list(
+        session.scalars(
+            select(StudySpace)
+            .where(StudySpace.subject_id == subject_id)
+            .order_by(StudySpace.id)
+            .with_for_update(of=StudySpace)
+        )
     )
     storage_keys = document_repository.storage_keys_for_parent(
         session, subject_id=subject_id
     )
+    document_ids = list(
+        session.scalars(
+            select(Document.id)
+            .where(Document.subject_id == subject_id)
+            .order_by(Document.id)
+        )
+    )
+    delete_document_dependent_work(session, document_ids)
     session.delete(subject)
     try:
         session.commit()

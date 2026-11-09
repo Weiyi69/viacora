@@ -66,7 +66,7 @@ def get_study_space(
         .where(StudySpace.id == study_space_id, Subject.user_id == user_id)
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update(of=StudySpace)
     return session.scalar(statement)
 
 
