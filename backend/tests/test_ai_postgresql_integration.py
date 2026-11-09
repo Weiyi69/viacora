@@ -11,7 +11,6 @@ from alembic.config import Config
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.engine import make_url
 
 from app.core.config import Settings
 from app.models import (
@@ -46,6 +45,7 @@ from app.services.ai_usage_reservations import (
 )
 from app.services.document_worker import DocumentLease, _publish_result
 from app.ai.provider import EmbeddingResult
+from postgresql_test_safety import validate_ai_test_database_url
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_ID = "openai-text-embedding-3-small-1536-v1"
@@ -54,41 +54,27 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture
 def ai_test_factory(monkeypatch: pytest.MonkeyPatch) -> sessionmaker[Session]:
-    url = os.getenv("AI_TEST_DATABASE_URL")
-    if not url:
-        pytest.skip("Set AI_TEST_DATABASE_URL to a disposable PostgreSQL *_test database")
-    parsed_url = make_url(url)
-    test_database_name = parsed_url.database or ""
-    configured_database_url = os.getenv("DATABASE_URL")
-    configured_url = make_url(configured_database_url) if configured_database_url else None
-    if (
-        not url.startswith("postgresql")
-        or not test_database_name.endswith("_test")
-        or test_database_name.lower() == "viacora_dev"
-        or (
-            configured_url is not None
-            and parsed_url.host == configured_url.host
-            and parsed_url.port == configured_url.port
-            and parsed_url.database == configured_url.database
+    try:
+        validated_url = validate_ai_test_database_url(
+            os.getenv("AI_TEST_DATABASE_URL"),
+            os.getenv("DATABASE_URL"),
         )
-    ):
-        pytest.fail(
-            "AI_TEST_DATABASE_URL must be a PostgreSQL *_test database, must not be "
-            "viacora_dev, and must differ from DATABASE_URL"
-        )
+    except ValueError as error:
+        pytest.fail(str(error))
+    validated_url_string = validated_url.render_as_string(hide_password=False)
 
-    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("DATABASE_URL", validated_url_string)
     monkeypatch.setenv("ENVIRONMENT", "test")
     original_env_file = Settings.model_config.get("env_file")
     Settings.model_config["env_file"] = None
     config = Config(str(BACKEND_ROOT / "alembic.ini"))
-    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    config.set_main_option("sqlalchemy.url", validated_url_string.replace("%", "%%"))
     try:
         command.upgrade(config, "head")
     finally:
         Settings.model_config["env_file"] = original_env_file
 
-    engine = create_engine(url, pool_pre_ping=True)
+    engine = create_engine(validated_url, pool_pre_ping=True)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT current_setting('server_version_num')::int")) >= 180000
         assert connection.scalar(
