@@ -1,14 +1,16 @@
+import logging
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import and_, create_engine, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -31,6 +33,7 @@ from app.models import (
 from app.services import document_indexing, document_worker
 from app.services.document_indexing import (
     IndexLease,
+    _claim_index_job,
     _activate_generation,
     process_next_index_job,
 )
@@ -38,7 +41,6 @@ from app.services.ai_retrieval import retrieve_passages
 from app.services.ai_usage_reservations import (
     UsageLimitExceeded,
     mark_dispatching,
-    mark_uncertain,
     recover_expired_reservations,
     reserve_usage,
     settle_usage,
@@ -50,6 +52,7 @@ from postgresql_test_safety import validate_ai_test_database_url
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_ID = "openai-text-embedding-3-small-1536-v1"
 pytestmark = pytest.mark.integration
+logger = logging.getLogger(__name__)
 
 
 @pytest.fixture
@@ -145,6 +148,28 @@ def _create_user(session: Session, suffix: str) -> User:
     session.add(user)
     session.flush()
     return user
+
+
+def _cleanup_test_user(
+    session_factory: sessionmaker[Session],
+    user_id: UUID | None,
+    *,
+    test_failed: bool,
+    description: str,
+) -> None:
+    if user_id is None:
+        return
+    try:
+        with session_factory() as session:
+            user = session.get(User, user_id)
+            if user is not None:
+                session.delete(user)
+                session.commit()
+    except Exception:
+        if test_failed:
+            logger.exception("Failed to clean up %s integration test data", description)
+        else:
+            raise
 
 
 def _create_ready_index(session: Session, document: Document) -> DocumentIndexGeneration:
@@ -411,6 +436,7 @@ def test_extraction_handoff_rolls_back_on_index_enqueue_failure(
         raise RuntimeError("injected generation enqueue failure")
 
     monkeypatch.setattr(document_indexing, "get_settings", lambda: _settings())
+    monkeypatch.setattr(document_worker, "get_settings", lambda: _settings())
     monkeypatch.setattr(document_indexing, "ensure_index_generation", fail_enqueue)
     monkeypatch.setattr(document_worker, "ensure_index_generation", fail_enqueue)
     with pytest.raises(RuntimeError, match="injected"):
@@ -437,6 +463,7 @@ def test_legacy_reconciliation_is_concurrent_and_idempotent(
 ) -> None:
     settings = _settings()
     monkeypatch.setattr(document_indexing, "get_settings", lambda: settings)
+    user_id = None
     with ai_test_factory() as session:
         with session.begin():
             user = _create_user(session, "reconcile")
@@ -449,82 +476,280 @@ def test_legacy_reconciliation_is_concurrent_and_idempotent(
                 )
             )
             document_id = document.id
+            user_id = user.id
 
     def reconcile() -> int:
-        return document_indexing.reconcile_missing_indexes(ai_test_factory, limit=10)
+        return document_indexing.reconcile_missing_indexes(ai_test_factory, limit=1)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        list(executor.map(lambda _: reconcile(), range(2)))
-    with ai_test_factory() as session:
-        assert session.scalar(
-            select(func.count()).select_from(DocumentIndexGeneration).where(
-                DocumentIndexGeneration.document_id == document_id
+    try:
+        with ai_test_factory() as isolation_session:
+            isolation_session.execute(
+                text("LOCK TABLE documents, subjects, study_spaces IN SHARE MODE")
             )
-        ) == 1
-        assert session.scalar(
-            select(func.count()).select_from(DocumentIndexJob).where(
-                DocumentIndexJob.document_id == document_id
+            list(
+                isolation_session.scalars(
+                    select(Document.id)
+                    .join(Subject, Subject.id == Document.subject_id)
+                    .join(StudySpace, StudySpace.id == Document.study_space_id)
+                    .where(
+                        Document.id != document_id,
+                        Document.status == "completed",
+                        Document.has_extractable_text.is_(True),
+                        Subject.archived_at.is_(None),
+                        StudySpace.archived_at.is_(None),
+                    )
+                    .with_for_update(of=Document)
+                )
             )
-        ) == 1
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                enqueue_counts = list(executor.map(lambda _: reconcile(), range(2)))
+            assert len(enqueue_counts) == 2
+            assert sum(enqueue_counts) == 1
+            with ai_test_factory() as session:
+                assert session.scalar(
+                    select(func.count()).select_from(DocumentIndexGeneration).where(
+                        DocumentIndexGeneration.document_id == document_id
+                    )
+                ) == 1
+                assert session.scalar(
+                    select(func.count()).select_from(DocumentIndexJob).where(
+                        DocumentIndexJob.document_id == document_id
+                    )
+                ) == 1
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="legacy reconciliation",
+        )
 
 
 def test_index_worker_persists_embeddings_and_activates_generation(
     ai_test_factory,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = _settings()
     monkeypatch.setattr(document_indexing, "get_settings", lambda: settings)
+    user_id = None
+    try:
+        with ai_test_factory() as session:
+            with session.begin():
+                user = _create_user(session, "worker")
+                older_document, _, _ = _create_document(
+                    session, user=user, suffix="worker-older"
+                )
+                session.add(
+                    DocumentPage(
+                        document_id=older_document.id,
+                        page_number=1,
+                        extracted_text="Older queued job.",
+                    )
+                )
+                older_generation = document_indexing.ensure_index_generation(
+                    session, older_document, settings=settings
+                )
+                older_job = session.scalar(
+                    select(DocumentIndexJob).where(
+                        DocumentIndexJob.generation_id == older_generation.id
+                    )
+                )
+                assert older_job is not None
+                older_job_id = older_job.id
+
+                document, _, _ = _create_document(session, user=user, suffix="worker")
+                session.add(
+                    DocumentPage(
+                        document_id=document.id,
+                        page_number=1,
+                        extracted_text="A concise page for indexing.",
+                    )
+                )
+                generation = document_indexing.ensure_index_generation(
+                    session, document, settings=settings
+                )
+                job = session.scalar(
+                    select(DocumentIndexJob).where(
+                        DocumentIndexJob.generation_id == generation.id
+                    )
+                )
+                assert job is not None
+                lease_token = uuid4()
+                job.status = "processing"
+                job.attempts_used = 1
+                job.lease_token = lease_token
+                job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+                lease = IndexLease(
+                    job_id=job.id,
+                    document_id=document.id,
+                    generation_id=generation.id,
+                    user_id=user.id,
+                    token=lease_token,
+                    attempts_used=job.attempts_used,
+                )
+                document_id = document.id
+                generation_id = generation.id
+                job_id = job.id
+                user_id = user.id
+
+        monkeypatch.setattr(
+            document_indexing,
+            "_claim_index_job",
+            lambda _session_factory: lease,
+        )
+
+        class FakeProvider:
+            def __init__(self, _settings: Settings) -> None:
+                pass
+
+            def embed(self, texts: list[str]) -> EmbeddingResult:
+                vector = tuple([1.0] + [0.0] * 1535)
+                return EmbeddingResult(
+                    vectors=tuple(vector for _ in texts),
+                    input_tokens=sum(len(text.encode("utf-8")) for text in texts),
+                    provider_request_id="fake-worker-request",
+                )
+
+        assert process_next_index_job(ai_test_factory, provider_factory=FakeProvider)
+        with ai_test_factory() as session:
+            generation = session.get(DocumentIndexGeneration, generation_id)
+            head = session.get(DocumentIndexHead, document_id)
+            job = session.get(DocumentIndexJob, job_id)
+            older_job = session.get(DocumentIndexJob, older_job_id)
+            diagnostics = (
+                f"job_id={job_id}, status={job.status if job else None}, "
+                f"error_code={job.error_code if job else None}, "
+                f"generation_status={generation.status if generation else None}, "
+                f"worker_logs={caplog.text}"
+            )
+            assert generation is not None and generation.status == "ready", diagnostics
+            assert head is not None and head.generation_id == generation_id
+            assert job is not None and job.status == "completed", diagnostics
+            assert job.error_code is None, diagnostics
+            assert older_job is not None and older_job.status == "queued"
+            assert older_job.error_code is None
+            assert session.scalar(
+                select(func.count()).select_from(DocumentChunkEmbedding).where(
+                    DocumentChunkEmbedding.generation_id == generation_id
+                )
+            ) == 1
+            assert session.scalar(
+                select(func.count()).select_from(AIUsageEvent).where(
+                    AIUsageEvent.document_id == document_id
+                )
+            ) == 1
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="worker activation",
+        )
+
+
+def test_index_job_claim_prioritizes_older_queued_job(
+    ai_test_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    monkeypatch.setattr(document_indexing, "get_settings", lambda: settings)
+    user_id = None
     with ai_test_factory() as session:
         with session.begin():
-            user = _create_user(session, "worker")
-            document, _, _ = _create_document(session, user=user, suffix="worker")
+            user = _create_user(session, "worker-order")
+            user_id = user.id
+            older_document, _, _ = _create_document(
+                session, user=user, suffix="worker-order-older"
+            )
             session.add(
                 DocumentPage(
-                    document_id=document.id,
+                    document_id=older_document.id,
                     page_number=1,
-                    extracted_text="A concise page for indexing.",
+                    extracted_text="Older queued job.",
                 )
             )
-            generation = document_indexing.ensure_index_generation(
-                session, document, settings=settings
+            older_generation = document_indexing.ensure_index_generation(
+                session, older_document, settings=settings
             )
-            document_id = document.id
-            generation_id = generation.id
-
-    class FakeProvider:
-        def __init__(self, _settings: Settings) -> None:
-            pass
-
-        def embed(self, texts: list[str]) -> EmbeddingResult:
-            vector = tuple([1.0] + [0.0] * 1535)
-            return EmbeddingResult(
-                vectors=tuple(vector for _ in texts),
-                input_tokens=sum(len(text.encode("utf-8")) for text in texts),
-                provider_request_id="fake-worker-request",
+            older_job = session.scalar(
+                select(DocumentIndexJob).where(
+                    DocumentIndexJob.generation_id == older_generation.id
+                )
             )
+            assert older_job is not None
+            older_job_id = older_job.id
 
-    assert process_next_index_job(ai_test_factory, provider_factory=FakeProvider)
-    with ai_test_factory() as session:
-        generation = session.get(DocumentIndexGeneration, generation_id)
-        head = session.get(DocumentIndexHead, document_id)
-        job = session.scalar(
-            select(DocumentIndexJob).where(
-                DocumentIndexJob.generation_id == generation_id
+            newer_document, _, _ = _create_document(
+                session, user=user, suffix="worker-order-newer"
             )
+            session.add(
+                DocumentPage(
+                    document_id=newer_document.id,
+                    page_number=1,
+                    extracted_text="Newer queued job.",
+                )
+            )
+            newer_generation = document_indexing.ensure_index_generation(
+                session, newer_document, settings=settings
+            )
+            newer_job = session.scalar(
+                select(DocumentIndexJob).where(
+                    DocumentIndexJob.generation_id == newer_generation.id
+                )
+            )
+            assert newer_job is not None
+            newer_job_id = newer_job.id
+
+            now = datetime.now(timezone.utc)
+            eligible = or_(
+                and_(
+                    DocumentIndexJob.status == "queued",
+                    or_(
+                        DocumentIndexJob.next_attempt_at.is_(None),
+                        DocumentIndexJob.next_attempt_at <= now,
+                    ),
+                ),
+                and_(
+                    DocumentIndexJob.status == "processing",
+                    or_(
+                        DocumentIndexJob.lease_expires_at.is_(None),
+                        DocumentIndexJob.lease_expires_at <= now,
+                    ),
+                ),
+            )
+            earliest_eligible_created_at = session.scalar(
+                select(func.min(DocumentIndexJob.created_at))
+                .join(Document, Document.id == DocumentIndexJob.document_id)
+                .join(Subject, Subject.id == Document.subject_id)
+                .join(StudySpace, StudySpace.id == Document.study_space_id)
+                .where(
+                    eligible,
+                    Subject.archived_at.is_(None),
+                    StudySpace.archived_at.is_(None),
+                )
+            )
+            assert earliest_eligible_created_at is not None
+            older_job.created_at = earliest_eligible_created_at - timedelta(seconds=2)
+            newer_job.created_at = earliest_eligible_created_at - timedelta(seconds=1)
+
+    try:
+        lease = _claim_index_job(ai_test_factory)
+
+        assert lease is not None
+        assert lease.job_id == older_job_id
+        with ai_test_factory() as session:
+            older_job = session.get(DocumentIndexJob, older_job_id)
+            newer_job = session.get(DocumentIndexJob, newer_job_id)
+            assert older_job is not None and older_job.status == "processing"
+            assert newer_job is not None and newer_job.status == "queued"
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="job claim",
         )
-        assert generation.status == "ready"
-        assert head is not None and head.generation_id == generation_id
-        assert job is not None and job.status == "completed"
-        assert session.scalar(
-            select(func.count()).select_from(DocumentChunkEmbedding).where(
-                DocumentChunkEmbedding.generation_id == generation_id
-            )
-        ) == 1
-        assert session.scalar(
-            select(func.count()).select_from(AIUsageEvent).where(
-                AIUsageEvent.document_id == document_id
-            )
-        ) == 1
 
 
 def test_generation_activation_keeps_old_index_until_new_is_complete(
@@ -667,69 +892,99 @@ def test_usage_reservations_serialize_concurrent_quota(ai_test_factory) -> None:
 
 def test_reservation_dispatch_crash_boundaries_and_settlement(ai_test_factory) -> None:
     settings = _settings()
-    with ai_test_factory() as session:
-        with session.begin():
-            user_id = _create_user(session, "crash").id
-    with ai_test_factory() as session:
-        undispatched = reserve_usage(
-            session,
-            user_id=user_id,
-            operation="query_embedding",
-            idempotency_key=f"before:{uuid4()}",
-            input_token_upper_bound=10,
-            settings=settings,
-        )
-        reservation_id = undispatched.id
-        assert not undispatched.dispatch_started_at
-    with ai_test_factory() as session:
-        reservation = session.get(AIUsageReservation, reservation_id)
-        reservation.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        session.commit()
-    recover_expired_reservations(ai_test_factory)
-    with ai_test_factory() as session:
-        assert session.get(AIUsageReservation, reservation_id).status == "released"
+    user_id = None
+    test_reservation_ids: set[UUID] = set()
 
-    with ai_test_factory() as session:
-        dispatched = reserve_usage(
-            session,
-            user_id=user_id,
-            operation="query_embedding",
-            idempotency_key=f"after:{uuid4()}",
-            input_token_upper_bound=10,
-            settings=settings,
-        )
-        dispatched_id = dispatched.id
-        mark_dispatching(session, dispatched_id)
-        mark_uncertain(session, dispatched_id, provider_request_id="unknown")
-        dispatched.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        session.commit()
-    recover_expired_reservations(ai_test_factory)
-    with ai_test_factory() as session:
-        uncertain = session.get(AIUsageReservation, dispatched_id)
-        assert uncertain.status == "uncertain"
-        uncertain.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        session.commit()
-    recover_expired_reservations(ai_test_factory)
-    with ai_test_factory() as session:
-        settled = session.get(AIUsageReservation, dispatched_id)
-        event = session.scalar(
-            select(AIUsageEvent).where(AIUsageEvent.reservation_id == dispatched_id)
-        )
-        assert settled.status == "estimated"
-        assert event is not None and event.accounting_basis == "conservative_estimate"
-        assert event.input_tokens == settled.reserved_input_tokens
+    def recover_test_reservations() -> int:
+        with ai_test_factory() as isolation_session:
+            # The recovery sweep uses SKIP LOCKED, so lock every other sweepable row.
+            list(
+                isolation_session.scalars(
+                    select(AIUsageReservation.id)
+                    .where(
+                        AIUsageReservation.status.in_(
+                            ("reserved", "dispatching", "uncertain")
+                        ),
+                        AIUsageReservation.id.not_in(test_reservation_ids),
+                    )
+                    .with_for_update()
+                )
+            )
+            return recover_expired_reservations(ai_test_factory)
 
-    with ai_test_factory() as session:
-        actual = reserve_usage(
-            session,
-            user_id=user_id,
-            operation="query_embedding",
-            idempotency_key=f"actual:{uuid4()}",
-            input_token_upper_bound=20,
-            settings=settings,
+    try:
+        with ai_test_factory() as session:
+            with session.begin():
+                user_id = _create_user(session, "crash").id
+        with ai_test_factory() as session:
+            undispatched = reserve_usage(
+                session,
+                user_id=user_id,
+                operation="query_embedding",
+                idempotency_key=f"before:{uuid4()}",
+                input_token_upper_bound=10,
+                settings=settings,
+            )
+            reservation_id = undispatched.id
+            test_reservation_ids.add(reservation_id)
+            assert not undispatched.dispatch_started_at
+        with ai_test_factory() as session:
+            reservation = session.get(AIUsageReservation, reservation_id)
+            reservation.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.commit()
+        assert recover_test_reservations() == 1
+        with ai_test_factory() as session:
+            assert session.get(AIUsageReservation, reservation_id).status == "released"
+
+        with ai_test_factory() as session:
+            dispatched = reserve_usage(
+                session,
+                user_id=user_id,
+                operation="query_embedding",
+                idempotency_key=f"after:{uuid4()}",
+                input_token_upper_bound=10,
+                settings=settings,
+            )
+            dispatched_id = dispatched.id
+            test_reservation_ids.add(dispatched_id)
+            mark_dispatching(session, dispatched_id)
+            dispatched.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.commit()
+        assert recover_test_reservations() == 1
+        with ai_test_factory() as session:
+            uncertain = session.get(AIUsageReservation, dispatched_id)
+            assert uncertain.status == "uncertain"
+            assert uncertain.expires_at > datetime.now(timezone.utc)
+            uncertain.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.commit()
+        assert recover_test_reservations() == 1
+        with ai_test_factory() as session:
+            settled = session.get(AIUsageReservation, dispatched_id)
+            event = session.scalar(
+                select(AIUsageEvent).where(AIUsageEvent.reservation_id == dispatched_id)
+            )
+            assert settled.status == "estimated"
+            assert event is not None and event.accounting_basis == "conservative_estimate"
+            assert event.input_tokens == settled.reserved_input_tokens
+
+        with ai_test_factory() as session:
+            actual = reserve_usage(
+                session,
+                user_id=user_id,
+                operation="query_embedding",
+                idempotency_key=f"actual:{uuid4()}",
+                input_token_upper_bound=20,
+                settings=settings,
+            )
+            mark_dispatching(session, actual.id)
+            first = settle_usage(session, actual.id, input_tokens=9, settings=settings)
+            second = settle_usage(session, actual.id, input_tokens=9, settings=settings)
+            assert first.id == second.id
+            assert second.accounting_basis == "provider_reported"
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="reservation recovery",
         )
-        mark_dispatching(session, actual.id)
-        first = settle_usage(session, actual.id, input_tokens=9, settings=settings)
-        second = settle_usage(session, actual.id, input_tokens=9, settings=settings)
-        assert first.id == second.id
-        assert second.accounting_basis == "provider_reported"
