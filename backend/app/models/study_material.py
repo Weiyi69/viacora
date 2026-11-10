@@ -24,7 +24,7 @@ class StudyMaterialJob(Base):
     __tablename__ = "study_material_jobs"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('notes')",
+            "kind IN ('notes', 'flashcards')",
             name="ck_study_material_jobs_kind",
         ),
         CheckConstraint(
@@ -171,7 +171,7 @@ class StudyMaterialJobSource(Base):
 class StudyMaterial(Base):
     __tablename__ = "study_materials"
     __table_args__ = (
-        CheckConstraint("kind IN ('notes')", name="ck_study_materials_kind"),
+        CheckConstraint("kind IN ('notes', 'flashcards')", name="ck_study_materials_kind"),
         CheckConstraint("schema_version > 0", name="ck_study_materials_schema_version"),
         CheckConstraint("version_number > 0", name="ck_study_materials_version"),
         CheckConstraint("length(trim(title)) > 0", name="ck_study_materials_title_nonblank"),
@@ -202,6 +202,8 @@ class StudyMaterial(Base):
         ),
         UniqueConstraint("job_id", name="uq_study_materials_job"),
         UniqueConstraint("id", "job_id", name="uq_study_materials_id_job"),
+        UniqueConstraint("id", "kind", name="uq_study_materials_id_kind"),
+        UniqueConstraint("user_id", "id", name="uq_study_materials_user_id_id"),
         UniqueConstraint("study_kit_id", "id", name="uq_study_materials_kit_id_id"),
         Index("ix_study_materials_user_kit", "user_id", "study_kit_id"),
         Index(
@@ -255,6 +257,12 @@ class StudyMaterial(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    cards: Mapped[list["StudyMaterialCard"]] = relationship(
+        back_populates="material",
+        foreign_keys="[StudyMaterialCard.user_id, StudyMaterialCard.material_id]",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class StudyMaterialCitation(Base):
@@ -284,6 +292,11 @@ class StudyMaterialCitation(Base):
             "study_material_id",
             "citation_key",
             name="uq_study_material_citations_material_key",
+        ),
+        UniqueConstraint(
+            "study_material_id",
+            "id",
+            name="uq_study_material_citations_material_id_id",
         ),
         Index("ix_study_material_citations_document", "document_id", "study_material_id"),
         Index(

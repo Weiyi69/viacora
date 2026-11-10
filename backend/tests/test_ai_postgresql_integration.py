@@ -5,6 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import importlib.util
 from pathlib import Path
 from threading import Barrier, Event, Lock, current_thread, local
 import time
@@ -14,6 +15,8 @@ from fastapi import HTTPException
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import and_, create_engine, delete, event, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -30,14 +33,22 @@ from app.models import (
     DocumentIndexHead,
     DocumentIndexJob,
     DocumentPage,
+    FlashcardReviewEvent,
     StudyKit,
     StudyMaterial,
+    StudyMaterialCard,
+    StudyMaterialCardCitation,
     StudyMaterialCitation,
     StudyMaterialJob,
     StudyMaterialJobSource,
     StudySpace,
     Subject,
     User,
+)
+from app.services.flashcard_learning import (
+    ReviewIdempotencyConflict,
+    create_review_event,
+    get_flashcard_progress,
 )
 from app.services import document_indexing, document_worker
 from app.services import study_material_jobs
@@ -51,6 +62,7 @@ from app.services.document_indexing import (
 from app.services.study_material_jobs import (
     IdempotencyConflict,
     StudyMaterialCitationInput,
+    StudyMaterialCardInput,
     StudyMaterialLease,
     StudyMaterialSource,
     cancel_study_material_job,
@@ -58,11 +70,13 @@ from app.services.study_material_jobs import (
     delete_document_dependent_work,
     enqueue_study_material_job,
     fail_study_material_job,
+    finalize_study_flashcard_job,
     finalize_study_material_job,
     recover_expired_study_material_jobs,
     renew_study_material_lease,
 )
 from app.services.ai_retrieval import retrieve_passages
+from app.services.study_material_generation import list_study_flashcard_materials
 from app.services.ai_usage_reservations import (
     UsageLimitExceeded,
     mark_dispatching,
@@ -1576,6 +1590,1252 @@ def test_study_material_provenance_constraints_and_database_cascades(
                 transaction.rollback()
 
 
+def test_flashcard_migration_downgrade_and_upgrade_restore_kind_constraints(
+    ai_test_factory,
+) -> None:
+    migration_path = BACKEND_ROOT / "alembic" / "versions" / "20261110_08_flashcards.py"
+    spec = importlib.util.spec_from_file_location(
+        "flashcard_migration_under_test", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    user_id: UUID | None = None
+    expected_flashcard_data: dict[str, int] = {}
+    with ai_test_factory() as session:
+        engine = session.get_bind()
+        with session.begin():
+            user = _create_user(session, "flashcard-migration-roundtrip")
+            document, subject, space = _create_document(
+                session, user=user, suffix="flashcard-migration-roundtrip"
+            )
+            generation = _create_ready_index(session, document)
+            kit = StudyKit(
+                user_id=user.id,
+                subject_id=subject.id,
+                study_space_id=space.id,
+                title="Migration round-trip kit",
+            )
+            session.add(kit)
+            session.flush()
+            flashcard_job = StudyMaterialJob(
+                user_id=user.id,
+                study_space_id=space.id,
+                study_kit_id=kit.id,
+                kind="flashcards",
+                status="completed",
+                attempts_used=1,
+                idempotency_key=f"migration-flashcards-{uuid4().hex}",
+                request_hash="a" * 64,
+                request_payload={"card_count": 1},
+            )
+            notes_job = StudyMaterialJob(
+                user_id=user.id,
+                study_space_id=space.id,
+                study_kit_id=kit.id,
+                kind="notes",
+                status="completed",
+                attempts_used=1,
+                idempotency_key=f"migration-notes-{uuid4().hex}",
+                request_hash="b" * 64,
+                request_payload={"detail_level": "standard"},
+            )
+            session.add_all([flashcard_job, notes_job])
+            session.flush()
+            _add_material_source(
+                session,
+                user=user,
+                kit=kit,
+                job=flashcard_job,
+                document=document,
+                generation=generation,
+            )
+            flashcard_material = StudyMaterial(
+                user_id=user.id,
+                study_kit_id=kit.id,
+                job_id=flashcard_job.id,
+                kind="flashcards",
+                version_number=1,
+                title="Migration test deck",
+                content={"card_count": 1},
+            )
+            notes_material = StudyMaterial(
+                user_id=user.id,
+                study_kit_id=kit.id,
+                job_id=notes_job.id,
+                kind="notes",
+                version_number=1,
+                title="Migration test notes",
+                content={"sections": []},
+            )
+            session.add_all([flashcard_material, notes_material])
+            session.flush()
+            citation = StudyMaterialCitation(
+                study_material_id=flashcard_material.id,
+                job_id=flashcard_job.id,
+                citation_key="P0001",
+                document_id=document.id,
+                generation_id=generation.id,
+                chunk_index=0,
+            )
+            card = StudyMaterialCard(
+                user_id=user.id,
+                material_id=flashcard_material.id,
+                position=0,
+                front="What does the source explain?",
+                back="It explains a study concept.",
+            )
+            session.add_all([citation, card])
+            session.flush()
+            session.add(
+                StudyMaterialCardCitation(
+                    material_id=flashcard_material.id,
+                    card_id=card.id,
+                    citation_id=citation.id,
+                )
+            )
+            session.add(
+                FlashcardReviewEvent(
+                    user_id=user.id,
+                    card_id=card.id,
+                    rating="remembered",
+                    idempotency_key=f"migration-review-{uuid4().hex}",
+                )
+            )
+            session.flush()
+            user_id = user.id
+            expected_flashcard_data = {
+                "jobs": int(
+                    session.scalar(
+                        select(func.count()).select_from(StudyMaterialJob).where(
+                            StudyMaterialJob.user_id == user.id,
+                            StudyMaterialJob.kind == "flashcards",
+                        )
+                    )
+                    or 0
+                ),
+                "cards": int(
+                    session.scalar(
+                        select(func.count()).select_from(StudyMaterialCard).where(
+                            StudyMaterialCard.user_id == user.id
+                        )
+                    )
+                    or 0
+                ),
+                "citations": int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(StudyMaterialCardCitation)
+                        .where(
+                            StudyMaterialCardCitation.material_id
+                            == flashcard_material.id
+                        )
+                    )
+                    or 0
+                ),
+                "reviews": int(
+                    session.scalar(
+                        select(func.count()).select_from(FlashcardReviewEvent).where(
+                            FlashcardReviewEvent.user_id == user.id
+                        )
+                    )
+                    or 0
+                ),
+            }
+
+    try:
+        assert all(count > 0 for count in expected_flashcard_data.values())
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                # The migration downgrade is exercised in a rolled-back transaction
+                # so the fixture database remains at head for other integration tests.
+                earlier_tables = [
+                    "study_material_jobs",
+                    "study_materials",
+                    "study_material_citations",
+                ]
+                migration_added_earlier_constraints = {
+                    "uq_study_materials_user_id_id",
+                    "uq_study_materials_id_kind",
+                    "uq_study_material_citations_material_id_id",
+                }
+                original_earlier_constraints = set(
+                    connection.scalars(
+                        text(
+                            "SELECT c.conname FROM pg_constraint AS c "
+                            "JOIN pg_class AS r ON r.oid = c.conrelid "
+                            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND r.relname = ANY(:tables)"
+                        ),
+                        {"tables": earlier_tables},
+                    )
+                )
+                original_earlier_indexes = set(
+                    connection.scalars(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = current_schema() "
+                            "AND tablename = ANY(:tables)"
+                        ),
+                        {"tables": earlier_tables},
+                    )
+                )
+                with Operations.context(MigrationContext.configure(connection)):
+                    migration.downgrade()
+
+                flashcard_jobs_remaining = connection.scalar(
+                    text(
+                        "SELECT count(*) FROM study_material_jobs "
+                        "WHERE kind = 'flashcards' AND user_id = :user_id"
+                    ),
+                    {"user_id": user_id},
+                )
+                assert flashcard_jobs_remaining == 0
+                assert connection.scalar(
+                    text(
+                        "SELECT count(*) FROM study_material_jobs "
+                        "WHERE kind = 'notes' AND user_id = :user_id"
+                    ),
+                    {"user_id": user_id},
+                ) == 1
+
+                assert connection.scalar(
+                    text("SELECT to_regclass('study_material_cards') IS NULL")
+                )
+                assert connection.scalar(
+                    text("SELECT to_regclass('study_material_card_citations') IS NULL")
+                )
+                assert connection.scalar(
+                    text("SELECT to_regclass('flashcard_review_events') IS NULL")
+                )
+                assert connection.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename IN ('study_material_cards', "
+                        "'study_material_card_citations', "
+                        "'flashcard_review_events')"
+                    )
+                ) == 0
+
+                trigger_names = {
+                    "flashcard_review_events_no_update",
+                    "flashcard_card_requires_citation",
+                    "flashcard_citation_set_remains_nonempty",
+                }
+                remaining_triggers = set(
+                    connection.scalars(
+                        text(
+                            "SELECT t.tgname "
+                            "FROM pg_trigger AS t "
+                            "JOIN pg_class AS r ON r.oid = t.tgrelid "
+                            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND NOT t.tgisinternal AND t.tgname = ANY(:names)"
+                        ),
+                        {"names": list(trigger_names)},
+                    )
+                )
+                assert remaining_triggers == set()
+
+                function_names = {
+                    "prevent_flashcard_review_event_update",
+                    "require_flashcard_card_citation",
+                    "require_flashcard_citation_set_nonempty",
+                }
+                remaining_functions = set(
+                    connection.scalars(
+                        text(
+                            "SELECT p.proname "
+                            "FROM pg_proc AS p "
+                            "JOIN pg_namespace AS n ON n.oid = p.pronamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND p.proname = ANY(:names)"
+                        ),
+                        {"names": list(function_names)},
+                    )
+                )
+                assert remaining_functions == set()
+
+                migration_constraints = {
+                    "uq_study_materials_user_id_id",
+                    "uq_study_materials_id_kind",
+                    "uq_study_material_citations_material_id_id",
+                    "ck_study_material_cards_material_kind",
+                    "ck_study_material_cards_position",
+                    "ck_study_material_cards_content_nonblank",
+                    "ck_study_material_cards_difficulty",
+                    "fk_study_material_cards_user_material",
+                    "fk_study_material_cards_material_kind",
+                    "uq_study_material_cards_material_position",
+                    "uq_study_material_cards_material_id_id",
+                    "uq_study_material_cards_user_id_id",
+                    "fk_study_material_card_citations_material_card",
+                    "fk_study_material_card_citations_material_citation",
+                    "uq_study_material_card_citations_card_citation",
+                    "ck_flashcard_review_events_rating",
+                    "fk_flashcard_review_events_user_card",
+                    "uq_flashcard_review_events_user_idempotency",
+                }
+                remaining_constraints = set(
+                    connection.scalars(
+                        text(
+                            "SELECT c.conname "
+                            "FROM pg_constraint AS c "
+                            "JOIN pg_namespace AS n ON n.oid = c.connamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND c.conname = ANY(:names)"
+                        ),
+                        {"names": list(migration_constraints)},
+                    )
+                )
+                assert remaining_constraints == set()
+                downgraded_earlier_constraints = set(
+                    connection.scalars(
+                        text(
+                            "SELECT c.conname FROM pg_constraint AS c "
+                            "JOIN pg_class AS r ON r.oid = c.conrelid "
+                            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND r.relname = ANY(:tables)"
+                        ),
+                        {"tables": earlier_tables},
+                    )
+                )
+                assert downgraded_earlier_constraints == (
+                    original_earlier_constraints
+                    - migration_added_earlier_constraints
+                )
+                downgraded_earlier_indexes = set(
+                    connection.scalars(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = current_schema() "
+                            "AND tablename = ANY(:tables)"
+                        ),
+                        {"tables": earlier_tables},
+                    )
+                )
+                assert downgraded_earlier_indexes == (
+                    original_earlier_indexes
+                    - migration_added_earlier_constraints
+                )
+
+                migration_indexes = {
+                    "ix_study_material_card_citations_material",
+                    "ix_flashcard_review_events_user_card",
+                    "ix_flashcard_review_events_card_reviewed",
+                }
+                remaining_indexes = set(
+                    connection.scalars(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = current_schema() "
+                            "AND indexname = ANY(:names)"
+                        ),
+                        {"names": list(migration_indexes)},
+                    )
+                )
+                assert remaining_indexes == set()
+
+                for earlier_table in (
+                    "study_material_jobs",
+                    "study_materials",
+                    "study_material_citations",
+                    "documents",
+                ):
+                    assert connection.scalar(
+                        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                        {"table_name": earlier_table},
+                    )
+
+                for table_name, constraint_name in (
+                    ("study_materials", "ck_study_materials_kind"),
+                    ("study_material_jobs", "ck_study_material_jobs_kind"),
+                ):
+                    definition = connection.scalar(
+                        text(
+                            "SELECT pg_get_constraintdef(constraint_row.oid) "
+                            "FROM pg_constraint AS constraint_row "
+                            "WHERE constraint_row.conname = :constraint_name "
+                            "AND constraint_row.conrelid = "
+                            "to_regclass(:table_name)"
+                        ),
+                        {
+                            "constraint_name": constraint_name,
+                            "table_name": table_name,
+                        },
+                    )
+                    assert definition is not None
+                    assert "notes" in definition
+                    assert "flashcards" not in definition
+
+                assert connection.scalar(
+                    text(
+                        "SELECT count(*) FROM study_materials "
+                        "WHERE kind = 'notes' AND title = 'Migration test notes'"
+                    )
+                ) == 1
+
+                with Operations.context(MigrationContext.configure(connection)):
+                    migration.upgrade()
+
+                trigger_bindings = {
+                    row[0]: (row[1], row[2].lower(), row[3])
+                    for row in connection.execute(
+                        text(
+                            "SELECT t.tgname, r.relname, pg_get_triggerdef(t.oid), "
+                            "p.proname "
+                            "FROM pg_trigger AS t "
+                            "JOIN pg_class AS r ON r.oid = t.tgrelid "
+                            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+                            "JOIN pg_proc AS p ON p.oid = t.tgfoid "
+                            "WHERE n.nspname = current_schema() "
+                            "AND NOT t.tgisinternal "
+                            "AND t.tgname = ANY(:names)"
+                        ),
+                        {"names": list(trigger_names)},
+                    )
+                }
+                assert set(trigger_bindings) == trigger_names
+                assert {
+                    name: (binding[0], binding[2])
+                    for name, binding in trigger_bindings.items()
+                } == {
+                    "flashcard_review_events_no_update": (
+                        "flashcard_review_events",
+                        "prevent_flashcard_review_event_update",
+                    ),
+                    "flashcard_card_requires_citation": (
+                        "study_material_cards",
+                        "require_flashcard_card_citation",
+                    ),
+                    "flashcard_citation_set_remains_nonempty": (
+                        "study_material_card_citations",
+                        "require_flashcard_citation_set_nonempty",
+                    ),
+                }
+                review_trigger_definition = trigger_bindings[
+                    "flashcard_review_events_no_update"
+                ][1]
+                assert "before delete or update" in review_trigger_definition
+                assert "after insert on" in trigger_bindings[
+                    "flashcard_card_requires_citation"
+                ][1]
+                assert "deferrable initially deferred" in trigger_bindings[
+                    "flashcard_card_requires_citation"
+                ][1]
+                citation_trigger_definition = trigger_bindings[
+                    "flashcard_citation_set_remains_nonempty"
+                ][1]
+                assert "after insert" in citation_trigger_definition
+                assert "or update" in citation_trigger_definition
+                assert "or delete" in citation_trigger_definition
+                assert "deferrable initially deferred" in citation_trigger_definition
+
+                for table_name in (
+                    "study_material_cards",
+                    "study_material_card_citations",
+                    "flashcard_review_events",
+                ):
+                    assert connection.scalar(
+                        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                        {"table_name": table_name},
+                    )
+                for name in trigger_names:
+                    assert connection.scalar(
+                        text(
+                            "SELECT EXISTS ("
+                            "SELECT 1 FROM pg_trigger AS t "
+                            "JOIN pg_class AS r ON r.oid = t.tgrelid "
+                            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND NOT t.tgisinternal AND t.tgname = :name)"
+                        ),
+                        {"name": name},
+                    )
+                for name in function_names:
+                    assert connection.scalar(
+                        text(
+                            "SELECT EXISTS ("
+                            "SELECT 1 FROM pg_proc AS p "
+                            "JOIN pg_namespace AS n ON n.oid = p.pronamespace "
+                            "WHERE n.nspname = current_schema() "
+                            "AND p.proname = :name)"
+                        ),
+                        {"name": name},
+                    )
+                restored_constraints = set(
+                    connection.scalars(
+                        text(
+                            "SELECT conname FROM pg_constraint "
+                            "WHERE connamespace = current_schema()::regnamespace "
+                            "AND conname = ANY(:names)"
+                        ),
+                        {"names": list(migration_constraints)},
+                    )
+                )
+                assert restored_constraints == migration_constraints
+                restored_indexes = set(
+                    connection.scalars(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = current_schema() "
+                            "AND indexname = ANY(:names)"
+                        ),
+                        {"names": list(migration_indexes)},
+                    )
+                )
+                assert restored_indexes == migration_indexes
+
+                upgraded_kind = connection.scalar(
+                    text(
+                        "SELECT pg_get_constraintdef(constraint_row.oid) "
+                        "FROM pg_constraint AS constraint_row "
+                        "WHERE constraint_row.conname = 'ck_study_materials_kind' "
+                        "AND constraint_row.conrelid = "
+                        "to_regclass('study_materials')"
+                    )
+                )
+                assert upgraded_kind is not None
+                assert "notes" in upgraded_kind and "flashcards" in upgraded_kind
+                composite_fk = connection.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'fk_study_material_cards_material_kind' "
+                        "AND contype = 'f' "
+                        "AND conrelid = to_regclass('study_material_cards'))"
+                    )
+                )
+                assert composite_fk
+            finally:
+                transaction.rollback()
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="flashcard migration downgrade and upgrade",
+        )
+
+
+def test_flashcard_material_kind_composite_foreign_key_rejects_notes_material(
+    ai_test_factory,
+) -> None:
+    user_id: UUID | None = None
+    with ai_test_factory() as session:
+        with session.begin():
+            user = _create_user(session, "flashcard-kind-fk")
+            _, subject, space = _create_document(
+                session, user=user, suffix="flashcard-kind-fk"
+            )
+            kit = StudyKit(
+                user_id=user.id,
+                subject_id=subject.id,
+                study_space_id=space.id,
+                title="Material kind FK kit",
+            )
+            session.add(kit)
+            session.flush()
+            notes_job = StudyMaterialJob(
+                user_id=user.id,
+                study_space_id=space.id,
+                study_kit_id=kit.id,
+                kind="notes",
+                status="completed",
+                attempts_used=1,
+                idempotency_key=f"notes-kind-fk-{uuid4().hex}",
+                request_hash="c" * 64,
+                request_payload={"detail_level": "standard"},
+            )
+            session.add(notes_job)
+            session.flush()
+            notes_material = StudyMaterial(
+                user_id=user.id,
+                study_kit_id=kit.id,
+                job_id=notes_job.id,
+                kind="notes",
+                version_number=1,
+                title="Notes for FK test",
+                content={"sections": []},
+            )
+            session.add(notes_material)
+            session.flush()
+            user_id = user.id
+            notes_material_id = notes_material.id
+
+    try:
+        with ai_test_factory() as session:
+            with pytest.raises(IntegrityError) as raised:
+                with session.begin_nested():
+                    session.add(
+                        StudyMaterialCard(
+                            user_id=user_id,
+                            material_id=notes_material_id,
+                            position=0,
+                            front="Invalid notes association",
+                            back="The material kind is notes.",
+                        )
+                    )
+                    session.flush()
+
+            assert (
+                raised.value.orig.diag.constraint_name
+                == "fk_study_material_cards_material_kind"
+            )
+            assert session.scalar(
+                select(func.count()).select_from(StudyMaterialCard).where(
+                    StudyMaterialCard.material_id == notes_material_id
+                )
+            ) == 0
+            assert session.get(StudyMaterial, notes_material_id) is not None
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="flashcard material kind composite foreign key",
+        )
+
+
+def test_flashcard_finalization_constraints_reviews_and_progress(
+    ai_test_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(
+        ai_embedding_profile_id=PROFILE_ID,
+        document_worker_lease_seconds=60,
+    )
+    monkeypatch.setattr(study_material_jobs, "get_settings", lambda: settings)
+    user_id = None
+    foreign_user_id = None
+    with ai_test_factory() as session:
+        with session.begin():
+            user = _create_user(session, "flashcards")
+            document, subject, space = _create_document(
+                session, user=user, suffix="flashcards-source"
+            )
+            generation = _create_ready_index(session, document)
+            kit = StudyKit(
+                user_id=user.id,
+                subject_id=subject.id,
+                study_space_id=space.id,
+                title="Flashcard kit",
+            )
+            session.add(kit)
+            session.flush()
+            job = StudyMaterialJob(
+                user_id=user.id,
+                study_space_id=space.id,
+                study_kit_id=kit.id,
+                kind="flashcards",
+                status="queued",
+                attempts_used=0,
+                idempotency_key=f"flashcards-{uuid4().hex}",
+                request_hash="a" * 64,
+                request_payload={"card_count": 1},
+            )
+            session.add(job)
+            session.flush()
+            _add_material_source(
+                session,
+                user=user,
+                kit=kit,
+                job=job,
+                document=document,
+                generation=generation,
+            )
+            user_id = user.id
+            job_id = job.id
+            document_id = document.id
+            generation_id = generation.id
+
+    try:
+        lease = claim_next_study_material_job(ai_test_factory)
+        assert lease is not None and lease.job_id == job_id and lease.kind == "flashcards"
+        citation = StudyMaterialCitationInput(
+            citation_key="P0001",
+            document_id=document_id,
+            generation_id=generation_id,
+            chunk_index=0,
+        )
+        with pytest.raises(IntegrityError):
+            finalize_study_flashcard_job(
+                ai_test_factory,
+                lease,
+                title="Rejected partial deck",
+                content={"card_count": 1},
+                citations=(citation,),
+                cards=(
+                    StudyMaterialCardInput(
+                        position=0,
+                        front="Invalid difficulty",
+                        back="This must roll back.",
+                        explanation=None,
+                        difficulty="invalid",
+                        tags=(),
+                        citation_keys=("P0001",),
+                    ),
+                ),
+            )
+        with ai_test_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(StudyMaterial).where(
+                    StudyMaterial.job_id == job_id
+                )
+            ) == 0
+            assert session.get(StudyMaterialJob, job_id).status == "processing"
+        assert finalize_study_flashcard_job(
+            ai_test_factory,
+            lease,
+            title="Source-grounded deck",
+            content={"card_count": 1},
+            citations=(citation,),
+            cards=(
+                StudyMaterialCardInput(
+                    position=0,
+                    front="What does the source explain?",
+                    back="It explains the learning concept.",
+                    explanation=None,
+                    difficulty="easy",
+                    tags=("fundamentals",),
+                    citation_keys=("P0001",),
+                ),
+            ),
+        )
+    except Exception:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=True,
+            description="flashcard finalization and review",
+        )
+        _cleanup_test_user(
+            ai_test_factory,
+            foreign_user_id,
+            test_failed=True,
+            description="flashcard deck ownership",
+        )
+        raise
+
+    try:
+        with ai_test_factory() as session:
+            material = session.scalar(
+                select(StudyMaterial).where(StudyMaterial.job_id == job_id)
+            )
+            assert material is not None and material.kind == "flashcards"
+            card = session.scalar(
+                select(StudyMaterialCard).where(
+                    StudyMaterialCard.material_id == material.id
+                )
+            )
+            assert card is not None and card.position == 0
+            assert card.material_id == material.id
+            assert material.kind == "flashcards"
+            citation_link = session.scalar(
+                select(StudyMaterialCardCitation).where(
+                    StudyMaterialCardCitation.card_id == card.id
+                )
+            )
+            assert citation_link is not None
+            citation_row = session.get(StudyMaterialCitation, citation_link.citation_id)
+            assert citation_row is not None
+            assert citation_row.study_material_id == material.id
+            assert citation_row.generation_id == generation_id
+
+            owner = session.get(User, user_id)
+            assert owner is not None
+            other_job = StudyMaterialJob(
+                user_id=owner.id,
+                study_space_id=lease.study_space_id,
+                study_kit_id=lease.study_kit_id,
+                kind="flashcards",
+                status="completed",
+                attempts_used=1,
+                idempotency_key=f"other-flashcards-{uuid4().hex}",
+                request_hash="b" * 64,
+                request_payload={"card_count": 1},
+            )
+            session.add(other_job)
+            session.flush()
+            _add_material_source(
+                session,
+                user=owner,
+                kit=session.get(StudyKit, lease.study_kit_id),
+                job=other_job,
+                document=session.get(Document, document_id),
+                generation=session.get(DocumentIndexGeneration, generation_id),
+            )
+            other_material = StudyMaterial(
+                user_id=owner.id,
+                study_kit_id=lease.study_kit_id,
+                job_id=other_job.id,
+                kind="flashcards",
+                version_number=2,
+                title="Other deck",
+                content={"card_count": 1},
+            )
+            session.add(other_material)
+            session.flush()
+            other_citation = StudyMaterialCitation(
+                study_material_id=other_material.id,
+                job_id=other_job.id,
+                citation_key="P0001",
+                document_id=document_id,
+                generation_id=generation_id,
+                chunk_index=0,
+            )
+            session.add(other_citation)
+            session.flush()
+
+            notes_job = StudyMaterialJob(
+                user_id=owner.id,
+                study_space_id=lease.study_space_id,
+                study_kit_id=lease.study_kit_id,
+                kind="notes",
+                status="completed",
+                attempts_used=1,
+                idempotency_key=f"notes-material-{uuid4().hex}",
+                request_hash="c" * 64,
+                request_payload={"detail_level": "standard"},
+            )
+            session.add(notes_job)
+            session.flush()
+            notes_material = StudyMaterial(
+                user_id=owner.id,
+                study_kit_id=lease.study_kit_id,
+                job_id=notes_job.id,
+                kind="notes",
+                version_number=1,
+                title="Notes material",
+                content={},
+            )
+            session.add(notes_material)
+            session.flush()
+            foreign_user = _create_user(session, "flashcards-foreign-owner")
+            foreign_subject = Subject(
+                user_id=foreign_user.id,
+                name="Foreign flashcard subject",
+            )
+            session.add(foreign_subject)
+            session.flush()
+            foreign_space = StudySpace(
+                subject_id=foreign_subject.id,
+                name="Foreign flashcard space",
+            )
+            session.add(foreign_space)
+            session.flush()
+            foreign_kit = StudyKit(
+                user_id=foreign_user.id,
+                subject_id=foreign_subject.id,
+                study_space_id=foreign_space.id,
+                title="Foreign flashcard kit",
+            )
+            session.add(foreign_kit)
+            session.flush()
+            foreign_job = StudyMaterialJob(
+                user_id=foreign_user.id,
+                study_space_id=foreign_space.id,
+                study_kit_id=foreign_kit.id,
+                kind="flashcards",
+                status="completed",
+                attempts_used=1,
+                idempotency_key=f"foreign-deck-{uuid4().hex}",
+                request_hash="f" * 64,
+                request_payload={"card_count": 1},
+            )
+            session.add(foreign_job)
+            session.flush()
+            foreign_material = StudyMaterial(
+                user_id=foreign_user.id,
+                study_kit_id=foreign_kit.id,
+                job_id=foreign_job.id,
+                kind="flashcards",
+                version_number=1,
+                title="Foreign deck",
+                content={"card_count": 1},
+            )
+            session.add(foreign_material)
+            session.flush()
+            foreign_user_id = foreign_user.id
+            decks, total_decks = list_study_flashcard_materials(
+                session,
+                user_id=owner.id,
+                page=1,
+                page_size=20,
+            )
+            assert total_decks == 2
+            assert {deck.id for deck in decks} == {material.id, other_material.id}
+            foreign_decks, foreign_total = list_study_flashcard_materials(
+                session,
+                user_id=foreign_user.id,
+                page=1,
+                page_size=20,
+            )
+            assert foreign_total == 1
+            assert [deck.id for deck in foreign_decks] == [foreign_material.id]
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    session.add(
+                        StudyMaterialCard(
+                            user_id=owner.id,
+                            material_id=notes_material.id,
+                            position=0,
+                            front="Cannot belong to notes",
+                            back="Database rejects this card.",
+                        )
+                    )
+                    session.flush()
+
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    session.add(
+                        StudyMaterialCard(
+                            user_id=owner.id,
+                            material_id=material.id,
+                            position=0,
+                            front="Duplicate position",
+                            back="Invalid",
+                        )
+                    )
+                    session.flush()
+
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    session.add(
+                        StudyMaterialCardCitation(
+                            material_id=material.id,
+                            card_id=card.id,
+                            citation_id=other_citation.id,
+                        )
+                    )
+                    session.flush()
+
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    session.add(
+                        StudyMaterialCard(
+                            user_id=owner.id,
+                            material_id=material.id,
+                            position=1,
+                            front="No source",
+                            back="This card has no citation",
+                        )
+                    )
+                    session.flush()
+                    session.execute(
+                        text(
+                            "SET CONSTRAINTS flashcard_card_requires_citation IMMEDIATE"
+                        )
+                    )
+
+            with pytest.raises(IntegrityError) as missing_citation:
+                with session.begin_nested():
+                    session.execute(
+                        delete(StudyMaterialCardCitation).where(
+                            StudyMaterialCardCitation.material_id == material.id,
+                            StudyMaterialCardCitation.card_id == card.id,
+                            StudyMaterialCardCitation.citation_id
+                            == citation_link.citation_id,
+                        )
+                    )
+                    session.execute(
+                        text(
+                            "SET CONSTRAINTS "
+                            "flashcard_citation_set_remains_nonempty IMMEDIATE"
+                        )
+                    )
+            assert missing_citation.value.orig.diag.sqlstate == "23514"
+            assert session.scalar(
+                select(func.count())
+                .select_from(StudyMaterialCardCitation)
+                .where(
+                    StudyMaterialCardCitation.material_id == material.id,
+                    StudyMaterialCardCitation.card_id == card.id,
+                )
+            ) == 1
+
+            card_id = card.id
+            material_id = material.id
+
+        barrier = Barrier(2)
+
+        def duplicate_review():
+            barrier.wait(timeout=5)
+            with ai_test_factory() as session:
+                return create_review_event(
+                    session,
+                    user_id=user_id,
+                    material_id=material_id,
+                    card_id=card_id,
+                    rating="remembered",
+                    idempotency_key="same-concurrent-review",
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            duplicate_events = list(executor.map(lambda _: duplicate_review(), range(2)))
+        assert duplicate_events[0].id == duplicate_events[1].id
+
+        conflicting_barrier = Barrier(2)
+
+        def conflicting_review(rating: str):
+            conflicting_barrier.wait(timeout=5)
+            with ai_test_factory() as session:
+                try:
+                    return create_review_event(
+                        session,
+                        user_id=user_id,
+                        material_id=material_id,
+                        card_id=card_id,
+                        rating=rating,
+                        idempotency_key="same-key-different-rating",
+                    )
+                except ReviewIdempotencyConflict:
+                    return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            conflicting_events = list(
+                executor.map(
+                    conflicting_review,
+                    ("remembered", "needs_review"),
+                )
+            )
+        assert sum(event is not None for event in conflicting_events) == 1
+        with ai_test_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(FlashcardReviewEvent).where(
+                    FlashcardReviewEvent.user_id == user_id,
+                    FlashcardReviewEvent.idempotency_key
+                    == "same-key-different-rating",
+                )
+            ) == 1
+
+        distinct_key_barrier = Barrier(2)
+
+        def distinct_key_review(index: int):
+            distinct_key_barrier.wait(timeout=5)
+            with ai_test_factory() as session:
+                return create_review_event(
+                    session,
+                    user_id=user_id,
+                    material_id=material_id,
+                    card_id=card_id,
+                    rating=("remembered", "needs_review")[index],
+                    idempotency_key=f"different-key-{index}",
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            distinct_key_events = list(
+                executor.map(distinct_key_review, range(2))
+            )
+        assert len({event.id for event in distinct_key_events}) == 2
+
+        time.sleep(0.02)
+        with ai_test_factory() as session:
+            latest = create_review_event(
+                session,
+                user_id=user_id,
+                material_id=material_id,
+                card_id=card_id,
+                rating="needs_review",
+                idempotency_key="later-review",
+            )
+            progress = get_flashcard_progress(
+                session,
+                user_id=user_id,
+                material_id=material_id,
+            )
+            assert progress == {
+                "material_id": material_id,
+                "total_cards": 1,
+                "new_cards": 0,
+                "reviewed_cards": 1,
+                "remembered_cards": 0,
+                "needs_review_cards": 1,
+                "total_attempts": 5,
+                "latest_reviewed_at": latest.reviewed_at,
+            }
+            assert (
+                get_flashcard_progress(
+                    session,
+                    user_id=uuid4(),
+                    material_id=material_id,
+                )
+                is None
+            )
+            with pytest.raises(LookupError):
+                create_review_event(
+                    session,
+                    user_id=uuid4(),
+                    material_id=material_id,
+                    card_id=card_id,
+                    rating="remembered",
+                    idempotency_key="foreign-review",
+                )
+
+        with ai_test_factory() as session:
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    session.execute(
+                        text(
+                            "UPDATE flashcard_review_events "
+                            "SET rating = 'remembered' WHERE id = :event_id"
+                        ),
+                        {"event_id": str(latest.id)},
+                    )
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    session.execute(
+                        text(
+                            "DELETE FROM flashcard_review_events WHERE id = :event_id"
+                        ),
+                        {"event_id": str(latest.id)},
+                    )
+            session.execute(
+                delete(StudyMaterial).where(StudyMaterial.id == material_id)
+            )
+            assert session.scalar(
+                select(func.count()).select_from(StudyMaterialCard).where(
+                    StudyMaterialCard.material_id == material_id
+                )
+            ) == 0
+            assert session.scalar(
+                select(func.count()).select_from(FlashcardReviewEvent).where(
+                    FlashcardReviewEvent.card_id == card_id
+                )
+            ) == 0
+            assert session.scalar(
+                select(func.count())
+                .select_from(StudyMaterialCardCitation)
+                .where(StudyMaterialCardCitation.material_id == material_id)
+            ) == 0
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="flashcard finalization and review",
+        )
+        _cleanup_test_user(
+            ai_test_factory,
+            foreign_user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="flashcard deck ownership",
+        )
+
+
+def test_stale_flashcard_lease_cannot_finalize(
+    ai_test_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(
+        ai_embedding_profile_id=PROFILE_ID,
+        document_worker_lease_seconds=30,
+    )
+    monkeypatch.setattr(study_material_jobs, "get_settings", lambda: settings)
+    user_id = None
+    with ai_test_factory() as session:
+        with session.begin():
+            user = _create_user(session, "stale-flashcard-lease")
+            document, subject, space = _create_document(
+                session, user=user, suffix="stale-flashcard-source"
+            )
+            generation = _create_ready_index(session, document)
+            kit = StudyKit(
+                user_id=user.id,
+                subject_id=subject.id,
+                study_space_id=space.id,
+                title="Stale flashcard kit",
+            )
+            session.add(kit)
+            session.flush()
+            lease_token = uuid4()
+            job = StudyMaterialJob(
+                user_id=user.id,
+                study_space_id=space.id,
+                study_kit_id=kit.id,
+                kind="flashcards",
+                status="processing",
+                attempts_used=1,
+                lease_token=lease_token,
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+                idempotency_key=f"stale-flashcard-{uuid4().hex}",
+                request_hash="e" * 64,
+                request_payload={"card_count": 1},
+            )
+            session.add(job)
+            session.flush()
+            _add_material_source(
+                session,
+                user=user,
+                kit=kit,
+                job=job,
+                document=document,
+                generation=generation,
+            )
+            lease = StudyMaterialLease(
+                job_id=job.id,
+                user_id=user.id,
+                study_space_id=space.id,
+                study_kit_id=kit.id,
+                token=lease_token,
+                attempts_used=job.attempts_used,
+            )
+            job_id = job.id
+            user_id = user.id
+            document_id = document.id
+            generation_id = generation.id
+
+    try:
+        assert not finalize_study_flashcard_job(
+            ai_test_factory,
+            lease,
+            title="Stale result",
+            content={"card_count": 1},
+            citations=(
+                StudyMaterialCitationInput(
+                    "P0001", document_id, generation_id, 0
+                ),
+            ),
+            cards=(
+                StudyMaterialCardInput(
+                    position=0,
+                    front="What does the source explain?",
+                    back="It explains the learning concept.",
+                    explanation=None,
+                    difficulty=None,
+                    tags=(),
+                    citation_keys=("P0001",),
+                ),
+            ),
+            now=datetime.now(timezone.utc) + timedelta(days=1),
+        )
+        with ai_test_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(StudyMaterial).where(
+                    StudyMaterial.job_id == job_id
+                )
+            ) == 0
+            assert session.scalar(
+                select(func.count())
+                .select_from(StudyMaterialCard)
+                .join(
+                    StudyMaterial,
+                    StudyMaterial.id == StudyMaterialCard.material_id,
+                )
+                .where(StudyMaterial.job_id == job_id)
+            ) == 0
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="stale flashcard lease",
+        )
+
+
 def test_study_material_job_leases_recover_and_reject_stale_tokens(
     ai_test_factory,
     monkeypatch: pytest.MonkeyPatch,
@@ -1753,8 +3013,10 @@ def test_study_material_job_leases_recover_and_reject_stale_tokens(
         )
 
 
+@pytest.mark.parametrize("kind", ("notes", "flashcards"))
 def test_study_material_cancellation_racing_finalization_is_serialized(
     ai_test_factory,
+    kind: str,
 ) -> None:
     user_id = None
     engine = ai_test_factory.kw["bind"]
@@ -1806,14 +3068,14 @@ def test_study_material_cancellation_racing_finalization_is_serialized(
                     user_id=user.id,
                     study_space_id=space.id,
                     study_kit_id=kit.id,
-                    kind="notes",
+                    kind=kind,
                     status="processing",
                     attempts_used=1,
                     lease_token=lease_token,
                     lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
                     idempotency_key=f"cancel-race-{uuid4().hex}",
                     request_hash="d" * 64,
-                    request_payload={},
+                    request_payload={"card_count": 1} if kind == "flashcards" else {},
                 )
                 session.add(job)
                 session.flush()
@@ -1851,16 +3113,34 @@ def test_study_material_cancellation_racing_finalization_is_serialized(
             )
 
         def finalize() -> bool:
+            citation = StudyMaterialCitationInput(
+                "source-1", document.id, generation.id, 0
+            )
+            if kind == "flashcards":
+                return finalize_study_flashcard_job(
+                    ai_test_factory,
+                    lease,
+                    title="Race result",
+                    content={"card_count": 1},
+                    citations=(citation,),
+                    cards=(
+                        StudyMaterialCardInput(
+                            position=0,
+                            front="What does the source explain?",
+                            back="It explains the learning concept.",
+                            explanation=None,
+                            difficulty=None,
+                            tags=(),
+                            citation_keys=("source-1",),
+                        ),
+                    ),
+                )
             return finalize_study_material_job(
                 ai_test_factory,
                 lease,
                 title="Race result",
                 content={"sections": []},
-                citations=(
-                    StudyMaterialCitationInput(
-                        "source-1", document.id, generation.id, 0
-                    ),
-                ),
+                citations=(citation,),
             )
 
         with ai_test_factory() as held_session:
@@ -1969,6 +3249,15 @@ def test_study_material_cancellation_racing_finalization_is_serialized(
                         StudyMaterial.job_id == job_id
                     )
                 ) == 0
+                assert session.scalar(
+                    select(func.count()).select_from(StudyMaterialCard).where(
+                        StudyMaterialCard.material_id.in_(
+                            select(StudyMaterial.id).where(
+                                StudyMaterial.job_id == job_id
+                            )
+                        )
+                    )
+                ) == 0
             else:
                 assert finalize_result
                 assert job.status == "completed"
@@ -1977,6 +3266,16 @@ def test_study_material_cancellation_racing_finalization_is_serialized(
                         StudyMaterial.job_id == job_id
                     )
                 ) == 1
+                if kind == "flashcards":
+                    assert session.scalar(
+                        select(func.count())
+                        .select_from(StudyMaterialCard)
+                        .join(
+                            StudyMaterial,
+                            StudyMaterial.id == StudyMaterialCard.material_id,
+                        )
+                        .where(StudyMaterial.job_id == job_id)
+                    ) == 1
     finally:
         if lock_holder is not None:
             if lock_holder.in_transaction():

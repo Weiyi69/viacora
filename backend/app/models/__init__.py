@@ -12,6 +12,11 @@ from app.models.ai_index import (
 from app.models.base import Base
 from app.models.document import Document, DocumentPage, DocumentUploadAttempt
 from app.models.email_action_token import EmailActionToken
+from app.models.flashcard import (
+    FlashcardReviewEvent,
+    StudyMaterialCard,
+    StudyMaterialCardCitation,
+)
 from app.models.learning_activity import LearningActivity
 from app.models.subject import Subject
 from app.models.study_space import StudySpace
@@ -41,11 +46,14 @@ __all__ = [
     "DocumentPage",
     "DocumentUploadAttempt",
     "EmailActionToken",
+    "FlashcardReviewEvent",
     "LearningActivity",
     "Subject",
     "StudySpace",
     "StudyKit",
     "StudyMaterial",
+    "StudyMaterialCard",
+    "StudyMaterialCardCitation",
     "StudyMaterialCitation",
     "StudyMaterialJob",
     "StudyMaterialJobSource",

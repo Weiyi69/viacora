@@ -11,6 +11,10 @@ from app.core.config import get_settings
 from app.models import StudyMaterialJob, User
 from app.schemas.learning import PageResponse
 from app.schemas.study_materials import (
+    FlashcardGenerationRequest,
+    FlashcardProgressResponse,
+    FlashcardReviewRequest,
+    FlashcardReviewResponse,
     StudyMaterialJobResponse,
     StudyMaterialResponse,
     StudyNotesGenerationRequest,
@@ -22,10 +26,17 @@ from app.services.rate_limit import (
     check_rate_limits_with_expiry,
 )
 from app.services.study_material_generation import (
+    enqueue_flashcards,
     enqueue_study_notes,
     get_study_material,
     get_study_material_job,
+    list_study_flashcard_materials,
     list_study_material_jobs,
+)
+from app.services.flashcard_learning import (
+    ReviewIdempotencyConflict,
+    create_review_event,
+    get_flashcard_progress,
 )
 from app.services.study_material_jobs import (
     IdempotencyConflict,
@@ -34,6 +45,7 @@ from app.services.study_material_jobs import (
 
 router = APIRouter(tags=["study materials"])
 MAX_STUDY_MATERIAL_JOB_PAGE = 1000
+MAX_FLASHCARD_DECK_PAGE = 1000
 
 
 def _retry_after_seconds(expires_at: datetime, *, now: datetime | None = None) -> int:
@@ -136,6 +148,53 @@ def post_study_notes_job(
     return StudyMaterialJobResponse.model_validate(job)
 
 
+@router.post(
+    "/study-kits/{study_kit_id}/study-material-jobs/flashcards",
+    response_model=StudyMaterialJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_csrf)],
+)
+def post_flashcards_job(
+    study_kit_id: UUID,
+    payload: FlashcardGenerationRequest,
+    idempotency_key: str = Header(
+        min_length=1, max_length=160, alias="Idempotency-Key"
+    ),
+    user: User = Depends(current_user),
+    session: Session = Depends(database_session),
+) -> StudyMaterialJobResponse:
+    if not get_settings().ai_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Study material generation is unavailable",
+        )
+    _enforce_new_enqueue_rate_limit(
+        session,
+        user_id=user.id,
+        idempotency_key=idempotency_key,
+    )
+    try:
+        job = enqueue_flashcards(
+            session,
+            user_id=user.id,
+            study_kit_id=study_kit_id,
+            document_ids=payload.document_ids,
+            card_count=payload.card_count,
+            idempotency_key=idempotency_key,
+        )
+    except IdempotencyConflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency key was already used for another request",
+        ) from None
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from None
+    return StudyMaterialJobResponse.model_validate(job)
+
+
 @router.get(
     "/study-kits/{study_kit_id}/study-material-jobs",
     response_model=PageResponse[StudyMaterialJobResponse],
@@ -205,6 +264,30 @@ def post_cancel_study_material_job(
 
 
 @router.get(
+    "/study-materials/flashcards",
+    response_model=PageResponse[StudyMaterialResponse],
+)
+def get_flashcard_decks(
+    page: int = Query(default=1, ge=1, le=MAX_FLASHCARD_DECK_PAGE),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user: User = Depends(current_user),
+    session: Session = Depends(database_session),
+) -> PageResponse[StudyMaterialResponse]:
+    items, total = list_study_flashcard_materials(
+        session,
+        user_id=user.id,
+        page=page,
+        page_size=page_size,
+    )
+    return PageResponse[StudyMaterialResponse](
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
+
+
+@router.get(
     "/study-materials/{material_id}",
     response_model=StudyMaterialResponse,
 )
@@ -224,3 +307,72 @@ def get_study_material_detail(
             detail="Study material not found",
         )
     return material
+
+
+@router.post(
+    "/study-materials/{material_id}/cards/{card_id}/reviews",
+    response_model=FlashcardReviewResponse,
+    dependencies=[Depends(require_csrf)],
+)
+def post_flashcard_review(
+    material_id: UUID,
+    card_id: UUID,
+    payload: FlashcardReviewRequest,
+    idempotency_key: str = Header(
+        min_length=1, max_length=160, alias="Idempotency-Key"
+    ),
+    user: User = Depends(current_user),
+    session: Session = Depends(database_session),
+) -> FlashcardReviewResponse:
+    try:
+        event = create_review_event(
+            session,
+            user_id=user.id,
+            material_id=material_id,
+            card_id=card_id,
+            rating=payload.rating,
+            idempotency_key=idempotency_key,
+        )
+    except ReviewIdempotencyConflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency key was already used for another review",
+        ) from None
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flashcard not found",
+        ) from None
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from None
+    return FlashcardReviewResponse(
+        id=event.id,
+        card_id=event.card_id,
+        rating=event.rating,
+        reviewed_at=event.reviewed_at,
+    )
+
+
+@router.get(
+    "/study-materials/{material_id}/progress",
+    response_model=FlashcardProgressResponse,
+)
+def get_study_material_progress(
+    material_id: UUID,
+    user: User = Depends(current_user),
+    session: Session = Depends(database_session),
+) -> FlashcardProgressResponse:
+    progress = get_flashcard_progress(
+        session,
+        user_id=user.id,
+        material_id=material_id,
+    )
+    if progress is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flashcard material not found",
+        )
+    return FlashcardProgressResponse(**progress)

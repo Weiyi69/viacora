@@ -8,7 +8,7 @@ _DOCUMENT_UPLOAD_PATH = re.compile(
 )
 _AI_RETRIEVAL_PATH = "/api/v1/ai/retrieval"
 _STUDY_MATERIAL_ENQUEUE_PATH = re.compile(
-    r"/api/v1/study-kits/[^/]+/study-material-jobs\Z"
+    r"/api/v1/study-kits/[^/]+/study-material-jobs(?:/flashcards)?\Z"
 )
 
 

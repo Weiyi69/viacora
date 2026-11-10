@@ -27,6 +27,8 @@ from app.models import (
     DocumentIndexJob,
     StudyKit,
     StudyMaterial,
+    StudyMaterialCard,
+    StudyMaterialCardCitation,
     StudyMaterialCitation,
     StudyMaterialJob,
     StudyMaterialJobSource,
@@ -46,6 +48,7 @@ class StudyMaterialLease:
     study_kit_id: UUID
     token: UUID
     attempts_used: int
+    kind: str = "notes"
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,17 @@ class StudyMaterialCitationInput:
     document_id: UUID
     generation_id: UUID
     chunk_index: int
+
+
+@dataclass(frozen=True)
+class StudyMaterialCardInput:
+    position: int
+    front: str
+    back: str
+    explanation: str | None
+    difficulty: str | None
+    tags: Sequence[str]
+    citation_keys: Sequence[str]
 
 
 class IdempotencyConflict(ValueError):
@@ -214,7 +228,10 @@ def enqueue_study_material_job(
     idempotency_key: str,
     request_payload: dict[str, Any],
     sources: Sequence[StudyMaterialSource],
+    kind: str = "notes",
 ) -> StudyMaterialJob:
+    if kind not in {"notes", "flashcards"}:
+        raise ValueError("Study material kind is invalid")
     if not idempotency_key or len(idempotency_key) > 160:
         raise ValueError("Idempotency key is invalid")
     if not sources:
@@ -282,7 +299,7 @@ def enqueue_study_material_job(
         user_id=user_id,
         study_space_id=kit.study_space_id,
         study_kit_id=kit.id,
-        kind="notes",
+        kind=kind,
         payload=request_payload,
         sources=source_hashes,
     )
@@ -302,7 +319,7 @@ def enqueue_study_material_job(
         user_id=user_id,
         study_space_id=kit.study_space_id,
         study_kit_id=kit.id,
-        kind="notes",
+        kind=kind,
         status="queued",
         attempts_used=0,
         idempotency_key=idempotency_key,
@@ -397,6 +414,7 @@ def claim_next_study_material_job(
                 study_kit_id=job.study_kit_id,
                 token=token,
                 attempts_used=job.attempts_used,
+                kind=job.kind,
             )
             session.commit()
             return lease
@@ -667,13 +685,15 @@ def cancel_jobs_for_kit(
     return {job.id for job in jobs}
 
 
-def finalize_study_material_job(
+def _finalize_study_material_job(
     session_factory: sessionmaker[Session],
     lease: StudyMaterialLease,
     *,
     title: str,
     content: dict[str, Any],
     citations: Sequence[StudyMaterialCitationInput],
+    kind: str,
+    cards: Sequence[StudyMaterialCardInput],
     now: datetime | None = None,
 ) -> bool:
     if not title.strip() or len(title) > 160:
@@ -682,6 +702,24 @@ def finalize_study_material_job(
         raise ValueError("Study material content must be an object")
     if not citations or len({citation.citation_key for citation in citations}) != len(citations):
         raise ValueError("Study material citations are invalid")
+    if kind not in {"notes", "flashcards"}:
+        raise ValueError("Study material kind is invalid")
+    if kind == "notes" and cards:
+        raise ValueError("Notes materials cannot contain flashcards")
+    if kind == "flashcards":
+        if not cards or len(cards) > 30:
+            raise ValueError("Flashcards are invalid")
+        citation_keys = {citation.citation_key for citation in citations}
+        if any(
+            card.position != position
+            or not card.front.strip()
+            or not card.back.strip()
+            or not card.citation_keys
+            or len(card.citation_keys) != len(set(card.citation_keys))
+            or any(key not in citation_keys for key in card.citation_keys)
+            for position, card in enumerate(cards)
+        ):
+            raise ValueError("Flashcard content or citations are invalid")
 
     with session_factory() as session:
         source_rows = list(
@@ -788,11 +826,21 @@ def finalize_study_material_job(
         if (
             kit is None
             or job is None
+            or job.kind != kind
             or job.lease_expires_at is None
             or job.lease_expires_at <= current_time
         ):
             session.rollback()
             return False
+        if kind == "flashcards":
+            requested_count = job.request_payload.get("card_count")
+            if (
+                not isinstance(requested_count, int)
+                or isinstance(requested_count, bool)
+                or not 1 <= requested_count <= 30
+                or len(cards) > requested_count
+            ):
+                raise ValueError("Flashcard count exceeds the job request")
         if len(documents) != len(source_rows):
             session.rollback()
             return False
@@ -854,7 +902,7 @@ def finalize_study_material_job(
             session.scalar(
                 select(func.max(StudyMaterial.version_number)).where(
                     StudyMaterial.study_kit_id == kit.id,
-                    StudyMaterial.kind == "notes",
+                    StudyMaterial.kind == kind,
                 )
             )
             or 0
@@ -864,16 +912,20 @@ def finalize_study_material_job(
             user_id=lease.user_id,
             study_kit_id=kit.id,
             job_id=job.id,
-            kind="notes",
+            kind=kind,
             schema_version=1,
             version_number=next_version,
             title=title,
             content=content,
         )
         session.add(material)
+        citation_ids: dict[str, UUID] = {}
         for citation in citations:
+            citation_id = uuid4()
+            citation_ids[citation.citation_key] = citation_id
             session.add(
                 StudyMaterialCitation(
+                    id=citation_id,
                     study_material_id=material.id,
                     job_id=job.id,
                     citation_key=citation.citation_key,
@@ -882,6 +934,31 @@ def finalize_study_material_job(
                     chunk_index=citation.chunk_index,
                 )
             )
+        if kind == "flashcards":
+            session.flush()
+            for card_input in cards:
+                card_id = uuid4()
+                session.add(
+                    StudyMaterialCard(
+                        id=card_id,
+                        user_id=lease.user_id,
+                        material_id=material.id,
+                        position=card_input.position,
+                        front=card_input.front,
+                        back=card_input.back,
+                        explanation=card_input.explanation,
+                        difficulty=card_input.difficulty,
+                        tags=list(card_input.tags),
+                    )
+                )
+                for citation_key in card_input.citation_keys:
+                    session.add(
+                        StudyMaterialCardCitation(
+                            material_id=material.id,
+                            card_id=card_id,
+                            citation_id=citation_ids[citation_key],
+                        )
+                    )
         job.status = "completed"
         job.lease_token = None
         job.lease_expires_at = None
@@ -891,6 +968,49 @@ def finalize_study_material_job(
         job.next_attempt_at = None
         session.commit()
         return True
+
+
+def finalize_study_material_job(
+    session_factory: sessionmaker[Session],
+    lease: StudyMaterialLease,
+    *,
+    title: str,
+    content: dict[str, Any],
+    citations: Sequence[StudyMaterialCitationInput],
+    now: datetime | None = None,
+) -> bool:
+    return _finalize_study_material_job(
+        session_factory,
+        lease,
+        title=title,
+        content=content,
+        citations=citations,
+        kind="notes",
+        cards=(),
+        now=now,
+    )
+
+
+def finalize_study_flashcard_job(
+    session_factory: sessionmaker[Session],
+    lease: StudyMaterialLease,
+    *,
+    title: str,
+    content: dict[str, Any],
+    citations: Sequence[StudyMaterialCitationInput],
+    cards: Sequence[StudyMaterialCardInput],
+    now: datetime | None = None,
+) -> bool:
+    return _finalize_study_material_job(
+        session_factory,
+        lease,
+        title=title,
+        content=content,
+        citations=citations,
+        kind="flashcards",
+        cards=cards,
+        now=now,
+    )
 
 
 def delete_document_dependent_work(

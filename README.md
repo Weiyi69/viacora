@@ -134,6 +134,40 @@ Use `GET /api/v1/study-kits/{study_kit_id}/study-material-jobs` to list jobs,
 `POST /api/v1/study-material-jobs/{job_id}/cancel` to cancel, and
 `GET /api/v1/study-materials/{material_id}` to retrieve completed notes.
 
+## Phase 6.5: Source-cited flashcards and learning progress
+
+The backend can enqueue flashcard decks for up to 10 owner-authorized,
+indexed documents with
+`POST /api/v1/study-kits/{study_kit_id}/study-material-jobs/flashcards`.
+The request accepts `document_ids` and a maximum `card_count` from 1 to 30,
+and requires CSRF protection and an `Idempotency-Key`. The generator may return
+fewer cards when the selected passages cannot support more distinct cards.
+Flashcards use only
+the job's pinned document and index-generation snapshots. Each finalized card
+is stored separately, has a unique position in its deck, and must link to at
+least one citation from that same material. A card citation identifies a
+retrieved passage; it does not prove that the card's claim is supported,
+accurate, current, or safe.
+An automated source-support assessment is also fallible and is not clinical
+verification or evidence of clinical correctness. Every deck remains an
+AI-generated, unreviewed draft and requires qualified nursing/clinical review
+before educational or clinical reliance. List completed, owner-scoped decks
+with `GET /api/v1/study-materials/flashcards` (pages 1–1,000; page size up to
+100).
+Enqueue bodies share the 2 KiB request limit and the per-user window quota
+described above; existing idempotency keys still replay or conflict normally.
+
+Learning reviews are append-only events. Submit `remembered` or `needs_review`
+to `POST /api/v1/study-materials/{material_id}/cards/{card_id}/reviews` with a
+distinct idempotency key for each review. Replaying a key for the same card
+and rating returns the existing event; using it for a different card or rating
+returns HTTP 409. `GET /api/v1/study-materials/{material_id}/progress` reports
+new and reviewed cards, each reviewed card's latest rating, total attempts,
+and the latest review time. Learning review is separate from clinical review:
+flashcards remain AI-generated, unreviewed materials, and learning ratings
+never establish or change clinical review status. Qualified nursing/clinical
+review is required before educational or clinical reliance.
+
 ## Prerequisites
 
 - Node.js 24 and pnpm 10
@@ -261,9 +295,22 @@ Do not point either integration-test URL at `viacora_dev` or a production
 database. The normal backend test suite applies migrations only to temporary
 SQLite databases.
 
-The Phase 5 PostgreSQL/pgvector integration tests are opt-in. Set
-`AI_TEST_DATABASE_URL` to a separate disposable PostgreSQL database ending in
-`_test`, with pgvector available, and never use `viacora_dev` or a production
-database. The tests apply Alembic migrations to that dedicated test database
-and validate vector behavior; SQLite does not validate pgvector types,
+The PostgreSQL/pgvector AI integration tests are opt-in. The test runner reads
+`AI_TEST_DATABASE_URL` from the process environment and requires its database
+name to be exactly `viacora_isolated_test`, with PostgreSQL 18+ and pgvector
+available. Keep `DATABASE_URL` pointed at the separate development database
+`viacora_dev`; the safety check requires it to be configured and to identify a
+different database target from the isolated test URL. Never point either URL
+at production or use `viacora_dev` as the test database.
+
+The fixture applies Alembic migrations to the isolated test database, so do not
+run this command unless both environment variables are correctly configured
+and `viacora_isolated_test` is prepared as a dedicated disposable database:
+
+```bash
+cd backend
+./.venv/Scripts/python.exe -m pytest -o addopts= -m integration tests/test_ai_postgresql_integration.py
+```
+
+These tests validate vector behavior; SQLite does not validate pgvector types,
 operators, or indexes.
