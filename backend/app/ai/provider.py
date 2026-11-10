@@ -36,4 +36,6 @@ class AIProvider(Protocol):
         instructions: str,
         input_text: str,
         output_schema: type[StructuredModel],
+        *,
+        max_output_tokens: int | None = None,
     ) -> StructuredOutputResult: ...

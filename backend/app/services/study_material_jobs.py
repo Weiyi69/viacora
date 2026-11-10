@@ -220,18 +220,39 @@ def enqueue_study_material_job(
     if not sources:
         raise ValueError("At least one indexed source is required")
 
-    kit = session.scalar(
+    kit_snapshot = session.scalar(
         select(StudyKit).where(
             StudyKit.id == study_kit_id,
             StudyKit.user_id == user_id,
             StudyKit.archived_at.is_(None),
         )
     )
-    if kit is None:
+    if kit_snapshot is None:
         raise ValueError("Study kit is unavailable")
 
+    subject = session.scalar(
+        select(Subject)
+        .where(
+            Subject.id == kit_snapshot.subject_id,
+            Subject.user_id == user_id,
+            Subject.archived_at.is_(None),
+        )
+        .with_for_update()
+    )
+    study_space = session.scalar(
+        select(StudySpace)
+        .where(
+            StudySpace.id == kit_snapshot.study_space_id,
+            StudySpace.subject_id == kit_snapshot.subject_id,
+            StudySpace.archived_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if subject is None or study_space is None:
+        raise ValueError("Study kit is unavailable")
     documents = _lock_source_documents(session, [source.document_id for source in sources])
     heads = _lock_index_heads(session, [document.id for document in documents])
+    _lock_document_index_generations_and_jobs(session, [document.id for document in documents])
     kit = session.scalar(
         select(StudyKit)
         .where(
@@ -240,24 +261,13 @@ def enqueue_study_material_job(
             StudyKit.archived_at.is_(None),
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
-    if kit is None:
-        raise ValueError("Study kit is unavailable")
-    study_space = session.scalar(
-        select(StudySpace).where(
-            StudySpace.id == kit.study_space_id,
-            StudySpace.subject_id == kit.subject_id,
-            StudySpace.archived_at.is_(None),
-        )
-    )
-    subject = session.scalar(
-        select(Subject).where(
-            Subject.id == kit.subject_id,
-            Subject.user_id == user_id,
-            Subject.archived_at.is_(None),
-        )
-    )
-    if study_space is None or subject is None:
+    if (
+        kit is None
+        or kit.subject_id != subject.id
+        or kit.study_space_id != study_space.id
+    ):
         raise ValueError("Study kit is unavailable")
 
     source_hashes = _active_source_selection(
@@ -553,6 +563,7 @@ def cancel_study_material_job(
                 StudyMaterialJob.user_id == user_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if job is None or job.status in {"completed", "failed", "cancelled"}:
             session.rollback()
@@ -669,6 +680,8 @@ def finalize_study_material_job(
         raise ValueError("Study material title is invalid")
     if not isinstance(content, dict):
         raise ValueError("Study material content must be an object")
+    if not citations or len({citation.citation_key for citation in citations}) != len(citations):
+        raise ValueError("Study material citations are invalid")
 
     with session_factory() as session:
         source_rows = list(
@@ -678,10 +691,75 @@ def finalize_study_material_job(
                 .order_by(StudyMaterialJobSource.document_id)
             )
         )
-        documents = _lock_source_documents(
-            session, [source.document_id for source in source_rows]
+        if not source_rows:
+            session.rollback()
+            return False
+        subject_id = session.scalar(
+            select(StudyKit.subject_id).where(
+                StudyKit.id == lease.study_kit_id,
+                StudyKit.user_id == lease.user_id,
+                StudyKit.study_space_id == lease.study_space_id,
+            )
         )
+        if subject_id is None:
+            session.rollback()
+            return False
+        subject = session.scalar(
+            select(Subject)
+            .where(
+                Subject.id == subject_id,
+                Subject.user_id == lease.user_id,
+                Subject.archived_at.is_(None),
+            )
+            .with_for_update()
+        )
+        study_space = session.scalar(
+            select(StudySpace)
+            .where(
+                StudySpace.id == lease.study_space_id,
+                StudySpace.subject_id == subject_id,
+                StudySpace.archived_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if subject is None or study_space is None:
+            session.rollback()
+            return False
+        documents = _lock_source_documents(session, [source.document_id for source in source_rows])
+        current_source_rows = list(
+            session.scalars(
+                select(StudyMaterialJobSource)
+                .where(StudyMaterialJobSource.job_id == lease.job_id)
+                .order_by(StudyMaterialJobSource.document_id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        initial_source_snapshots = {
+            (
+                source.document_id,
+                source.generation_id,
+                source.source_document_sha256,
+                source.user_id,
+                source.study_space_id,
+            )
+            for source in source_rows
+        }
+        current_source_snapshots = {
+            (
+                source.document_id,
+                source.generation_id,
+                source.source_document_sha256,
+                source.user_id,
+                source.study_space_id,
+            )
+            for source in current_source_rows
+        }
+        if initial_source_snapshots != current_source_snapshots:
+            session.rollback()
+            return False
+        source_rows = current_source_rows
         heads = _lock_index_heads(session, [document.id for document in documents])
+        _lock_document_index_generations_and_jobs(session, [document.id for document in documents])
         kit = session.scalar(
             select(StudyKit)
             .where(
@@ -691,6 +769,7 @@ def finalize_study_material_job(
                 StudyKit.archived_at.is_(None),
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         job = session.scalar(
             select(StudyMaterialJob)
@@ -715,24 +794,6 @@ def finalize_study_material_job(
             session.rollback()
             return False
         if len(documents) != len(source_rows):
-            session.rollback()
-            return False
-
-        subject = session.scalar(
-            select(Subject).where(
-                Subject.id == kit.subject_id,
-                Subject.user_id == lease.user_id,
-                Subject.archived_at.is_(None),
-            )
-        )
-        study_space = session.scalar(
-            select(StudySpace).where(
-                StudySpace.id == lease.study_space_id,
-                StudySpace.subject_id == kit.subject_id,
-                StudySpace.archived_at.is_(None),
-            )
-        )
-        if subject is None or study_space is None:
             session.rollback()
             return False
 

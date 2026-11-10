@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.ai.openai_provider import OpenAIProvider
@@ -33,6 +33,8 @@ from app.services.ai_usage_reservations import (
 @dataclass(frozen=True)
 class RetrievalPassage:
     document_id: UUID
+    generation_id: UUID
+    chunk_index: int
     document_name: str
     page_start: int
     page_end: int
@@ -132,6 +134,7 @@ def retrieve_passages(
     user_id: UUID,
     query: str,
     document_ids: list[UUID] | None = None,
+    source_generations: dict[UUID, UUID] | None = None,
     top_k: int = 5,
     settings: Settings | None = None,
     provider_factory=OpenAIProvider,
@@ -142,6 +145,12 @@ def retrieve_passages(
     normalized_query = query.strip()
     if not normalized_query or len(normalized_query) > settings.ai_query_max_chars:
         raise ValueError("Retrieval query is empty or exceeds its character limit")
+    if source_generations is not None and (
+        not source_generations
+        or len(source_generations) > 10
+        or (document_ids is not None and set(document_ids) != set(source_generations))
+    ):
+        raise ValueError("Pinned retrieval sources are invalid")
     vector = embed_query(
         session,
         user_id=user_id,
@@ -153,11 +162,13 @@ def retrieve_passages(
     similarity = 1 - DocumentChunkEmbedding.embedding.cosine_distance(list(vector))
     statement = (
         select(
-            DocumentChunk.text,
-            Document.id,
-            Document.original_filename,
-            DocumentChunk.page_start,
-            DocumentChunk.page_end,
+            DocumentChunk.text.label("text"),
+            Document.id.label("document_id"),
+            DocumentIndexGeneration.id.label("generation_id"),
+            DocumentChunk.chunk_index.label("chunk_index"),
+            Document.original_filename.label("document_name"),
+            DocumentChunk.page_start.label("page_start"),
+            DocumentChunk.page_end.label("page_end"),
             similarity.label("similarity"),
         )
         .join(
@@ -220,22 +231,65 @@ def retrieve_passages(
             AIEmbeddingProfile.profile_id == profile.profile_id,
             similarity >= settings.ai_retrieval_min_similarity,
         )
-        .order_by(DocumentChunkEmbedding.embedding.cosine_distance(list(vector)))
-        .limit(top_k)
     )
-    if document_ids is not None:
-        statement = statement.where(Document.id.in_(document_ids))
-    rows = session.execute(statement).all()
+    if source_generations is not None:
+        source_filters = [
+            and_(
+                Document.id == document_id,
+                DocumentIndexGeneration.id == generation_id,
+            )
+            for document_id, generation_id in source_generations.items()
+        ]
+        statement = statement.where(or_(*source_filters))
+        distance = DocumentChunkEmbedding.embedding.cosine_distance(list(vector))
+        ranked = statement.add_columns(
+            func.row_number()
+            .over(partition_by=Document.id, order_by=distance)
+            .label("document_rank")
+        ).subquery()
+        pinned_statement = (
+            select(
+                ranked.c.text,
+                ranked.c.document_id,
+                ranked.c.generation_id,
+                ranked.c.chunk_index,
+                ranked.c.document_name,
+                ranked.c.page_start,
+                ranked.c.page_end,
+                ranked.c.similarity,
+            )
+            .where(ranked.c.document_rank <= top_k)
+            .order_by(ranked.c.document_id, ranked.c.document_rank)
+        )
+        rows = session.execute(pinned_statement).all()
+    else:
+        if document_ids is not None:
+            statement = statement.where(Document.id.in_(document_ids))
+        statement = statement.order_by(
+            DocumentChunkEmbedding.embedding.cosine_distance(list(vector))
+        ).limit(top_k)
+        rows = session.execute(statement).all()
     return [
         RetrievalPassage(
             document_id=document_id,
+            generation_id=generation_id,
+            chunk_index=chunk_index,
             document_name=filename,
             page_start=page_start,
             page_end=page_end,
             text=text_value,
             similarity=float(score),
         )
-        for text_value, document_id, filename, page_start, page_end, score in rows
+        for (
+            text_value,
+            document_id,
+            generation_id,
+            chunk_index,
+            filename,
+            page_start,
+            page_end,
+            score,
+        ) in rows
     ]
 
 

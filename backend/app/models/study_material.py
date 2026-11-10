@@ -107,6 +107,10 @@ class StudyMaterialJob(Base):
         overlaps="materials,study_kit",
     )
 
+    @property
+    def material_id(self) -> uuid.UUID | None:
+        return self.material.id if self.material is not None else None
+
 
 class StudyMaterialJobSource(Base):
     __tablename__ = "study_material_job_sources"

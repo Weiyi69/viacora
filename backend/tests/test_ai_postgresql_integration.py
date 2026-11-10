@@ -1591,9 +1591,10 @@ def test_study_material_job_leases_recover_and_reject_stale_tokens(
     with ai_test_factory() as session:
         with session.begin():
             user = _create_user(session, "material-lifecycle")
-            _, subject, space = _create_document(
+            document, subject, space = _create_document(
                 session, user=user, suffix="material-lifecycle"
             )
+            generation = _create_ready_index(session, document)
             kit = StudyKit(
                 user_id=user.id,
                 subject_id=subject.id,
@@ -1618,10 +1619,27 @@ def test_study_material_job_leases_recover_and_reject_stale_tokens(
             ]
             session.add_all(jobs)
             session.flush()
+            for job in jobs:
+                _add_material_source(
+                    session,
+                    user=user,
+                    kit=kit,
+                    job=job,
+                    document=document,
+                    generation=generation,
+                )
             job_ids = {job.id for job in jobs}
             kit_id = kit.id
+            document_id = document.id
+            generation_id = generation.id
             user_id = user.id
 
+    citation = StudyMaterialCitationInput(
+        citation_key="P0001",
+        document_id=document_id,
+        generation_id=generation_id,
+        chunk_index=0,
+    )
     base_time = datetime.now(timezone.utc)
     try:
         queue_guard = ai_test_factory()
@@ -1649,7 +1667,7 @@ def test_study_material_job_leases_recover_and_reject_stale_tokens(
             first_lease,
             title="Late result",
             content={},
-            citations=(),
+            citations=(citation,),
             now=base_time + timedelta(seconds=3),
         )
 
@@ -1663,7 +1681,7 @@ def test_study_material_job_leases_recover_and_reject_stale_tokens(
             second_lease,
             title="Expired result",
             content={},
-            citations=(),
+            citations=(citation,),
             now=recovery_time,
         )
         assert recover_expired_study_material_jobs(
@@ -1973,6 +1991,131 @@ def test_study_material_cancellation_racing_finalization_is_serialized(
             user_id,
             test_failed=sys.exc_info()[0] is not None,
             description="study material cancellation race",
+        )
+
+
+def test_cancellation_refreshes_job_state_after_finalization_commits(
+    ai_test_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = None
+    finalization_result: bool | None = None
+    try:
+        with ai_test_factory() as session:
+            with session.begin():
+                user = _create_user(session, "cancel-refresh-race")
+                document, subject, space = _create_document(
+                    session, user=user, suffix="cancel-refresh-race"
+                )
+                generation = _create_ready_index(session, document)
+                kit = StudyKit(
+                    user_id=user.id,
+                    subject_id=subject.id,
+                    study_space_id=space.id,
+                    title="Cancellation refresh kit",
+                )
+                session.add(kit)
+                session.flush()
+                lease_token = uuid4()
+                job = StudyMaterialJob(
+                    user_id=user.id,
+                    study_space_id=space.id,
+                    study_kit_id=kit.id,
+                    kind="notes",
+                    status="processing",
+                    attempts_used=1,
+                    lease_token=lease_token,
+                    lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                    idempotency_key=f"cancel-refresh-{uuid4().hex}",
+                    request_hash="d" * 64,
+                    request_payload={},
+                )
+                session.add(job)
+                session.flush()
+                session.add(
+                    StudyMaterialJobSource(
+                        job_id=job.id,
+                        document_id=document.id,
+                        user_id=user.id,
+                        study_space_id=space.id,
+                        generation_id=generation.id,
+                        source_document_sha256=document.content_sha256,
+                    )
+                )
+                lease = StudyMaterialLease(
+                    job_id=job.id,
+                    user_id=user.id,
+                    study_space_id=space.id,
+                    study_kit_id=kit.id,
+                    token=lease_token,
+                    attempts_used=job.attempts_used,
+                )
+                job_id = job.id
+                document_id = document.id
+                generation_id = generation.id
+                user_id = user.id
+
+        original_lock_source_documents = study_material_jobs._lock_source_documents
+
+        def finalize_after_cancellation_snapshot(
+            session: Session, source_document_ids: list[UUID]
+        ) -> list[Document]:
+            nonlocal finalization_result
+            if finalization_result is None:
+                finalization_result = False
+                finalization_result = finalize_study_material_job(
+                    ai_test_factory,
+                    lease,
+                    title="Completed before cancellation lock",
+                    content={"sections": []},
+                    citations=(
+                        StudyMaterialCitationInput(
+                            "P0001", document_id, generation_id, 0
+                        ),
+                    ),
+                )
+            return original_lock_source_documents(session, source_document_ids)
+
+        monkeypatch.setattr(
+            study_material_jobs,
+            "_lock_source_documents",
+            finalize_after_cancellation_snapshot,
+        )
+        cancel_result = cancel_study_material_job(
+            ai_test_factory, user_id=user_id, job_id=job_id
+        )
+
+        assert finalization_result is True
+        assert cancel_result is False
+        with ai_test_factory() as session:
+            job = session.get(StudyMaterialJob, job_id)
+            assert job is not None and job.status == "completed"
+            materials = list(
+                session.scalars(
+                    select(StudyMaterial).where(StudyMaterial.job_id == job_id)
+                )
+            )
+            assert len(materials) == 1
+            citations = list(
+                session.scalars(
+                    select(StudyMaterialCitation).where(
+                        StudyMaterialCitation.job_id == job_id
+                    )
+                )
+            )
+            assert len(citations) == 1
+            citation = citations[0]
+            assert citation.study_material_id == materials[0].id
+            assert citation.citation_key == "P0001"
+            assert citation.document_id == document_id
+            assert citation.generation_id == generation_id
+            assert citation.chunk_index == 0
+    finally:
+        _cleanup_test_user(
+            ai_test_factory,
+            user_id,
+            test_failed=sys.exc_info()[0] is not None,
+            description="study material cancellation refresh race",
         )
 
 
@@ -3412,16 +3555,8 @@ def test_concurrent_finalization_allocates_distinct_material_versions(
     ai_test_factory,
 ) -> None:
     user_id = None
-    engine = ai_test_factory.kw["bind"]
-    lock_barrier = Barrier(2)
-
-    def synchronize_document_lock(
-        _connection, cursor, statement, _parameters, _context, _many
-    ):
-        lowered = statement.lower()
-        if "from documents" in lowered and "for update" in lowered:
-            lock_barrier.wait(timeout=5)
-            cursor.execute("SET LOCAL lock_timeout = '5s'")
+    worker_start_barrier = Barrier(2)
+    citation: StudyMaterialCitationInput
 
     try:
         with ai_test_factory() as session:
@@ -3472,8 +3607,15 @@ def test_concurrent_finalization_allocates_distinct_material_versions(
                         )
                     )
                 user_id = user.id
+                document_id = document.id
+                generation_id = generation.id
 
-        event.listen(engine, "before_cursor_execute", synchronize_document_lock)
+        citation = StudyMaterialCitationInput(
+            citation_key="P0001",
+            document_id=document_id,
+            generation_id=generation_id,
+            chunk_index=0,
+        )
 
         def finalize(lease: StudyMaterialLease) -> bool:
             return finalize_study_material_job(
@@ -3481,17 +3623,20 @@ def test_concurrent_finalization_allocates_distinct_material_versions(
                 lease,
                 title="Concurrent notes",
                 content={"sections": []},
-                citations=(),
+                citations=(citation,),
             )
 
-        try:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                results = [
-                    future.result(timeout=15)
-                    for future in [pool.submit(finalize, lease) for lease in leases]
+        def finalize_concurrently(lease: StudyMaterialLease) -> bool:
+            worker_start_barrier.wait(timeout=5)
+            return finalize(lease)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [
+                future.result(timeout=15)
+                for future in [
+                    pool.submit(finalize_concurrently, lease) for lease in leases
                 ]
-        finally:
-            event.remove(engine, "before_cursor_execute", synchronize_document_lock)
+            ]
         assert results == [True, True]
         with ai_test_factory() as session:
             versions = list(
@@ -3502,6 +3647,38 @@ def test_concurrent_finalization_allocates_distinct_material_versions(
                 )
             )
             assert versions == [1, 2]
+            material_ids_by_job = dict(
+                session.execute(
+                    select(StudyMaterial.job_id, StudyMaterial.id).where(
+                        StudyMaterial.job_id.in_([lease.job_id for lease in leases])
+                    )
+                ).all()
+            )
+            citations = session.execute(
+                select(
+                    StudyMaterialCitation.job_id,
+                    StudyMaterialCitation.study_material_id,
+                    StudyMaterialCitation.citation_key,
+                    StudyMaterialCitation.document_id,
+                    StudyMaterialCitation.generation_id,
+                    StudyMaterialCitation.chunk_index,
+                )
+                .where(
+                    StudyMaterialCitation.job_id.in_(
+                        [lease.job_id for lease in leases]
+                    )
+                )
+                .order_by(StudyMaterialCitation.job_id)
+            ).all()
+            assert len(citations) == 2
+            assert all(
+                citation.study_material_id == material_ids_by_job[citation.job_id]
+                and citation.citation_key == "P0001"
+                and citation.document_id == document_id
+                and citation.generation_id == generation_id
+                and citation.chunk_index == 0
+                for citation in citations
+            )
         assert not finalize(leases[0])
         with ai_test_factory() as session:
             assert session.scalar(

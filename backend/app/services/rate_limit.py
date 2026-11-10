@@ -97,7 +97,9 @@ def _cleanup_expired(session: Session, cleanup_time: datetime) -> None:
     )
 
 
-def check_rate_limits(limits: list[RateLimit]) -> bool:
+def check_rate_limits_with_expiry(
+    limits: list[RateLimit],
+) -> tuple[bool, datetime]:
     settings = get_settings()
     now_epoch = int(time())
     window_seconds = settings.rate_limit_window_seconds
@@ -119,10 +121,15 @@ def check_rate_limits(limits: list[RateLimit]) -> bool:
                     expires_at,
                 )
                 allowed = allowed and count <= limit.maximum
-        return allowed
+        return allowed, expires_at
     except Exception as error:
         logger.exception("Authentication rate-limit storage failed")
         raise RateLimitUnavailable("Authentication protection is unavailable") from error
     finally:
         if session is not None:
             session.close()
+
+
+def check_rate_limits(limits: list[RateLimit]) -> bool:
+    allowed, _ = check_rate_limits_with_expiry(limits)
+    return allowed

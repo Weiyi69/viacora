@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     ai_retrieval_min_similarity: float = Field(default=0.2, ge=0, le=1)
     ai_daily_input_token_limit: int = Field(default=100_000, gt=0)
     ai_daily_cost_limit_usd: Decimal = Field(default=Decimal("0.50"), gt=0)
+    study_material_enqueue_limit: int = Field(default=5, gt=0, le=100)
+    study_material_max_request_bytes: int = Field(default=2048, gt=0, le=2048)
     ai_pricing_version: str | None = None
     ai_embedding_input_usd_per_million: Decimal | None = Field(default=None, gt=0)
     ai_structured_input_usd_per_million: Decimal | None = Field(default=None, gt=0)

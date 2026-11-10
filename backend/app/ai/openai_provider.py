@@ -88,14 +88,25 @@ class OpenAIProvider:
         instructions: str,
         input_text: str,
         output_schema: type[StructuredModel],
+        *,
+        max_output_tokens: int | None = None,
     ) -> StructuredOutputResult:
         try:
-            response = self._client.responses.parse(
-                model=self._settings.ai_structured_output_model,
-                instructions=instructions,
-                input=input_text,
-                text_format=output_schema,
-            )
+            if max_output_tokens is None:
+                response = self._client.responses.parse(
+                    model=self._settings.ai_structured_output_model,
+                    instructions=instructions,
+                    input=input_text,
+                    text_format=output_schema,
+                )
+            else:
+                response = self._client.responses.parse(
+                    model=self._settings.ai_structured_output_model,
+                    instructions=instructions,
+                    input=input_text,
+                    text_format=output_schema,
+                    max_output_tokens=max_output_tokens,
+                )
         except _RETRYABLE_EXCEPTIONS:
             raise AIProviderError("provider_temporarily_unavailable", retryable=True) from None
         except APIStatusError as error:

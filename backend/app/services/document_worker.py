@@ -19,6 +19,7 @@ from app.services.document_indexing import (
 )
 from app.services.ai_usage_reservations import recover_expired_reservations
 from app.services.study_material_jobs import recover_expired_study_material_jobs
+from app.services.study_material_generation import process_next_study_material_job
 from app.services.pdf_extraction import (
     PermanentPdfError,
     StaleDocumentLease,
@@ -366,20 +367,21 @@ def run_worker(
     reconcile_orphaned_files(session_factory)
     last_cleanup = time.monotonic()
     last_ai_recovery = time.monotonic()
-    prefer_index = False
+    work_cursor = 0
     while True:
         try:
             work = (
-                (process_next_index_job, process_next_document)
-                if prefer_index
-                else (process_next_document, process_next_index_job)
+                process_next_document,
+                process_next_index_job,
+                process_next_study_material_job,
             )
             processed = False
-            for process in work:
+            for offset in range(len(work)):
+                process = work[(work_cursor + offset) % len(work)]
                 if process(session_factory):
                     processed = True
+                    work_cursor = (work_cursor + offset + 1) % len(work)
                     break
-            prefer_index = not prefer_index
         except SQLAlchemyError:
             logger.exception("Document worker database operation failed")
             processed = False

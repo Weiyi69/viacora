@@ -38,13 +38,14 @@ app.add_middleware(
     allow_origins=_frontend_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-CSRF-Token"],
+    allow_headers=["Content-Type", "X-CSRF-Token", "Idempotency-Key"],
     expose_headers=["Retry-After"],
 )
 app.add_middleware(
     RequestBodyLimitMiddleware,
     max_bytes=settings.document_max_request_bytes,
     ai_max_bytes=settings.ai_max_request_bytes,
+    study_material_max_bytes=settings.study_material_max_request_bytes,
     allowed_origins=set(_frontend_origins()),
 )
 

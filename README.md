@@ -102,6 +102,38 @@ filters by owner and active parent resources. Retrieved text is untrusted data,
 not instructions or tool input. `GET /api/v1/ai/usage` reports only the current
 user's recorded usage.
 
+## Phase 6.4: AI-generated nursing notes
+
+The authenticated backend can enqueue nursing study notes for up to 10
+owner-authorized, indexed PDF documents in a study kit. The endpoint
+`POST /api/v1/study-kits/{study_kit_id}/study-material-jobs` requires CSRF
+protection, an `Idempotency-Key` header, and `document_ids`; its only option is
+`detail_level` (`concise`, `standard`, or `detailed`, default `standard`).
+Reusing a key with the same normalized request and source snapshot returns the
+existing job; reusing it for different input returns HTTP 409. A new key
+intentionally creates a new immutable material version.
+
+The existing worker retrieves only passages from each job's snapshotted
+document and index generation. Generated note points require validated citation
+keys, persisted against exact chunks; page ranges are returned from those
+chunks. Returned materials are explicitly marked as AI-generated and
+unreviewed drafts. Citations identify retrieved source passages only; they do
+not establish that a clinical statement is supported, accurate, current, or
+safe. Qualified nursing/clinical review is required before educational or
+clinical reliance. No automated clinical verification is claimed.
+
+Study-notes enqueue bodies are limited to 2 KiB. Each user may submit up to
+five new idempotency keys per rate-limit window (15 minutes by default);
+retries using an existing key retain the normal replay or conflict behavior
+and do not consume another slot. Study-material job listing is limited to page
+numbers 1 through 1,000, with the existing maximum page size of 100.
+Structured-generation usage is accounted separately from query embeddings,
+and ambiguous provider outcomes remain conservatively reserved.
+Use `GET /api/v1/study-kits/{study_kit_id}/study-material-jobs` to list jobs,
+`GET /api/v1/study-material-jobs/{job_id}` to check status,
+`POST /api/v1/study-material-jobs/{job_id}/cancel` to cancel, and
+`GET /api/v1/study-materials/{material_id}` to retrieve completed notes.
+
 ## Prerequisites
 
 - Node.js 24 and pnpm 10

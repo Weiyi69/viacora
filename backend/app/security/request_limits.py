@@ -7,6 +7,9 @@ _DOCUMENT_UPLOAD_PATH = re.compile(
     r"/api/v1/subjects/[^/]+/study-spaces/[^/]+/documents\Z"
 )
 _AI_RETRIEVAL_PATH = "/api/v1/ai/retrieval"
+_STUDY_MATERIAL_ENQUEUE_PATH = re.compile(
+    r"/api/v1/study-kits/[^/]+/study-material-jobs\Z"
+)
 
 
 class RequestBodyLimitMiddleware:
@@ -17,10 +20,12 @@ class RequestBodyLimitMiddleware:
         max_bytes: int,
         allowed_origins: set[str],
         ai_max_bytes: int = 8192,
+        study_material_max_bytes: int = 2048,
     ) -> None:
         self.app = app
         self.max_bytes = max_bytes
         self.ai_max_bytes = ai_max_bytes
+        self.study_material_max_bytes = study_material_max_bytes
         self.allowed_origins = allowed_origins
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -38,6 +43,9 @@ class RequestBodyLimitMiddleware:
         elif path == _AI_RETRIEVAL_PATH:
             max_bytes = self.ai_max_bytes
             message = b'{"detail":"Request body exceeds the maximum size"}'
+        elif _STUDY_MATERIAL_ENQUEUE_PATH.fullmatch(path):
+            max_bytes = self.study_material_max_bytes
+            message = b'{"detail":"Study-material request exceeds the maximum size"}'
         else:
             await self.app(scope, receive, send)
             return

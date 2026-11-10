@@ -110,6 +110,34 @@ def test_structured_output_is_schema_validated_by_provider() -> None:
     )
 
 
+def test_structured_output_passes_output_token_bound() -> None:
+    class Result(BaseModel):
+        label: str
+
+    client = _client()
+    parsed = Result(label="validated")
+    client.responses.parse.return_value = SimpleNamespace(
+        output_parsed=parsed,
+        usage=SimpleNamespace(input_tokens=3, output_tokens=2),
+        _request_id="request-id",
+    )
+
+    OpenAIProvider(_settings(), client).structured_output(
+        "Return a label.",
+        "Input",
+        Result,
+        max_output_tokens=250,
+    )
+
+    client.responses.parse.assert_called_once_with(
+        model="gpt-4o-mini",
+        instructions="Return a label.",
+        input="Input",
+        text_format=Result,
+        max_output_tokens=250,
+    )
+
+
 def test_provider_construction_fails_closed_when_disabled() -> None:
     with pytest.raises(RuntimeError, match="disabled or not configured"):
         OpenAIProvider(Settings(_env_file=None))
